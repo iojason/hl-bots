@@ -497,6 +497,15 @@ class MarketMaker:
         except Exception as e:
             self.log({"type": "warn", "op": "backfill_fills", "msg": str(e)})
 
+        # Subscribe to real-time market data updates for each coin
+        try:
+            if hasattr(self.client, "on_market_data_update"):
+                for coin in self.cfg.get("coins", []):
+                    self.client.on_market_data_update(coin, self._on_market_data_update)
+                    self.log({"type": "info", "op": "market_data_subscription", "coin": coin, "msg": "Subscribed to real-time market data"})
+        except Exception as e:
+            self.log({"type": "warn", "op": "market_data_subscription", "msg": str(e)})
+
         # Check WebSocket connection status
         if self.client.use_websocket and hasattr(self.client, 'ws_market_data'):
             ws_connected = self.client.ws_market_data.is_connected()
@@ -1442,6 +1451,26 @@ class MarketMaker:
             )
         except Exception as e:
             self.log({"type": "error", "msg": f"Error in _on_user_fill: {e}"})
+
+    def _on_market_data_update(self, market_data: Dict[str, Any]):
+        """Real-time market data callback - place orders immediately when data arrives."""
+        try:
+            # Extract coin from market data (now included by WebSocket callback)
+            coin = market_data.get("coin")
+            if not coin or coin not in self.cfg.get("coins", []):
+                return
+            
+            best_bid = market_data.get("best_bid", 0.0)
+            best_ask = market_data.get("best_ask", 0.0)
+            
+            if best_bid <= 0 or best_ask <= 0:
+                return
+            
+            # Place orders immediately for this coin
+            self._place_orders_for_coin_realtime(coin, best_bid, best_ask)
+            
+        except Exception as e:
+            self.log({"type": "error", "op": "market_data_callback", "msg": f"Error in market data callback: {e}"})
             
     
     def _c(self, coin: Optional[str], key: str, default=None):
@@ -1501,6 +1530,156 @@ class MarketMaker:
         except Exception:
             # If gating logic fails, fall back to normal behavior
             pass
+
+    def _place_orders_for_coin_realtime(self, coin: str, best_bid: float, best_ask: float):
+        """Real-time order placement for a single coin - called immediately when market data arrives."""
+        try:
+            # Skip if market data is invalid
+            if best_bid <= 0 or best_ask <= 0:
+                return
+            
+            spread = best_ask - best_bid
+            if spread <= 0:
+                return
+            
+            tick = self._effective_tick(coin, best_bid, best_ask)
+            step = float(self.client.sz_step(coin))
+            mid = 0.5 * (best_bid + best_ask)
+            spread_bps_live = (spread / max(mid, 1e-12)) * 10_000.0
+            
+            # min-spread gate (bps) with dynamic floor
+            base_min_spread_bps = self._cf(coin, "min_spread_bps", 0.0)
+            eff_min_spread_bps = base_min_spread_bps
+            dyn = self._dyn_min_spread.get(coin)
+            if dyn is not None:
+                eff_min_spread_bps = max(eff_min_spread_bps, float(dyn))
+            if eff_min_spread_bps > 0.0 and spread_bps_live < eff_min_spread_bps:
+                return  # skip this coin this update
+            
+            # desired size (USD -> units), then round UP to size step
+            target_notional = self._cf(coin, "size_notional_usd", 100.0)
+            raw_units = max(1e-12, target_notional / max(mid, 1e-12))
+            size_units = round_up_units(raw_units, step)
+            
+            # margin cap
+            size_units = self._cap_size_by_margin(coin, mid, size_units)
+            if size_units <= 0 or size_units < step:
+                return
+            
+            # enforce exchange minimum notional (e.g., $10)
+            min_usd = self._cf(coin, "exchange_min_order_usd", 10.0)
+            if mid * size_units < min_usd:
+                bump_units = round_up_units(min_usd / max(mid, 1e-12), step)
+                bumped = self._cap_size_by_margin(coin, mid, bump_units)
+                if bumped >= step and (bumped * mid) >= min_usd:
+                    size_units = bumped
+                else:
+                    return
+            
+            # current per-coin notional & position management
+            st = self.coin_state(coin)
+            notional = abs(st.pos) * mid
+            
+            # risk caps
+            max_coin_cap = float(self.cfg.get("max_per_coin_notional", 300.0))
+            max_gross_cap = float(self.cfg.get("max_gross_notional", 600.0))
+            
+            # Calculate current gross exposure
+            gross = 0.0
+            try:
+                for c, s in self.state.items():
+                    gross += abs(s.pos) * self.mark_mid(c)
+            except Exception:
+                pass
+            
+            # Take profit on large profitable positions first
+            if self._maybe_take_profit(coin):
+                return  # Position was closed, skip placing new orders
+            
+            # Safety flatten if position too large
+            self.flatten_if_needed(coin, mid)
+            
+            # Enhanced bailout check for underwater positions
+            if self._enhanced_bailout_check(coin):
+                return  # Position was bailed out, skip placing new orders
+            
+            # Join or improve inside the spread with a 1-tick cushion when possible.
+            if spread >= 2.0 * tick:
+                # Improve by 1 tick but never cross the opposite touch
+                bid_px = min(best_ask - tick, best_bid + tick)
+                ask_px = max(best_bid + tick, best_ask - tick)
+            else:
+                # One-tick spread: just join at the touch to stay ALO-safe
+                bid_px = max(best_bid, 0.0001)
+                ask_px = best_ask
+            
+            # Additional safety: ensure prices are reasonable
+            if bid_px <= 0 or ask_px <= 0:
+                return
+            
+            # Sanity check: ensure prices are within reasonable bounds of market
+            if bid_px > best_ask or ask_px < best_bid:
+                return
+            
+            # inventory skew
+            inv_skew_ticks = int(self._c(coin, "inventory_skew_ticks", 0))
+            if inv_skew_ticks > 0 and coin not in ['PENGU', 'BIO']:
+                if st.pos > 0:  # long -> worsen bid
+                    bid_px = max(bid_px - inv_skew_ticks * tick, 0.0001)
+                elif st.pos < 0:  # short -> worsen ask
+                    ask_px = ask_px + inv_skew_ticks * tick
+            
+            # join-then-improve if touch is stale (use adaptive tick size)
+            if coin not in ['PENGU', 'BIO']:
+                bid_px = self._maybe_improve("B", coin, bid_px, best_bid, best_ask, tick)
+                ask_px = self._maybe_improve("A", coin, ask_px, best_bid, best_ask, tick)
+            
+            # Check single-sided mode and get optimal prices
+            allowed_side = self._get_single_side(coin)
+            
+            # Place orders based on single-sided mode with optimal pricing
+            if allowed_side == "B" and notional < max_coin_cap and gross < max_gross_cap:
+                # Use market-aware logic for optimal bid price
+                optimal_bid_px = self._get_optimal_single_side_price(coin, "B", bid_px, tick, best_bid, best_ask)
+                self._place_single_order_realtime(coin, "B", optimal_bid_px, size_units, best_bid, best_ask)
+                
+            elif allowed_side == "A" and notional < max_coin_cap and gross < max_gross_cap:
+                # Use market-aware logic for optimal ask price
+                optimal_ask_px = self._get_optimal_single_side_price(coin, "A", ask_px, tick, best_bid, best_ask)
+                self._place_single_order_realtime(coin, "A", optimal_ask_px, size_units, best_bid, best_ask)
+                
+            elif allowed_side == "N":
+                # No quote state - don't place any orders
+                pass
+                
+            elif allowed_side is None:
+                # Single-sided mode is off - place both sides
+                if notional < max_coin_cap and gross < max_gross_cap:
+                    self._place_single_order_realtime(coin, "B", bid_px, size_units, best_bid, best_ask)
+                    self._place_single_order_realtime(coin, "A", ask_px, size_units, best_bid, best_ask)
+                    
+        except Exception as e:
+            self.log({"type": "error", "op": "realtime_order_placement", "coin": coin, "msg": str(e)})
+
+    def _place_single_order_realtime(self, coin: str, side: str, price: float, size: float, best_bid: float, best_ask: float):
+        """Place a single order in real-time with minimal latency."""
+        try:
+            # Place the order immediately using IOC
+            self._place_post_only_quantized(side, coin, price, size, best_bid, best_ask)
+            
+            # Log successful placement
+            self._tlog({
+                "type": "order", 
+                "coin": coin, 
+                "side": side, 
+                "price": price, 
+                "size": size, 
+                "status": "placed_realtime",
+                "latency": "sub_ms"
+            })
+            
+        except Exception as e:
+            self.log({"type": "error", "op": "single_order_realtime", "coin": coin, "side": side, "msg": str(e)})
 
         is_buy = side == "B"
 
@@ -1975,295 +2154,80 @@ class MarketMaker:
         except Exception:
             pass
 
-        # quote each coin
-        batch_orders = []
+        # Real-time order placement is now handled via WebSocket callbacks
+        # This loop now only handles housekeeping and telemetry
         
-        # Pre-fetch all market data from WebSocket to avoid individual REST calls
-        market_data_cache = {}
-        
-        # Configurable market data update frequency
-        market_data_update_freq = int(self.cfg.get("market_data_update_freq", 1))  # Every N loops
-        
-        # Only update market data every N loops to reduce WebSocket usage
-        should_update_market_data = (self.loop_i % market_data_update_freq == 0)
-        
-        # Try to get all market data from WebSocket first
-        if self.client.use_websocket and hasattr(self.client, 'ws_market_data') and should_update_market_data:
-            for coin in self.cfg["coins"]:
+        # Update spread history for dynamic min_spread calculations
+        if self.cfg.get("dynamic_min_spread_enabled", True):
+            for coin in self.cfg.get("coins", []):
                 try:
                     if not self.client.supports(coin):
                         continue
                     
-                    data = self.client.ws_market_data.market_data.get(coin)
-                    if data and (time.time() - data.get("timestamp", 0)) < 5.0:  # 5 second cache
-                        market_data_cache[coin] = {
-                            "best_bid": float(data.get("best_bid", 0.0)),
-                            "best_ask": float(data.get("best_ask", 0.0)),
-                            "source": "ws"
-                        }
-                except Exception:
-                    pass    
-        
-        # If WebSocket data is missing for any coins, try a single REST call for all missing coins
-        missing_coins = [coin for coin in self.cfg["coins"] if coin not in market_data_cache and self.client.supports(coin)]
-        if missing_coins and should_update_market_data:
-            try:
-                # Use a single REST call to get all missing coins' data
-                for coin in missing_coins:
-                    try:
-                        best_bid, best_ask = self.client.best_bid_ask(coin)
-                        market_data_cache[coin] = {
-                            "best_bid": best_bid,
-                            "best_ask": best_ask,
-                            "source": "rest"
-                        }
-                    except Exception as e:
-                        self.log({"type": "warn", "coin": coin, "msg": f"market data fetch failed: {e}"})
-                        continue
-            except Exception as e:
-                self.log({"type": "warn", "msg": f"bulk market data fetch failed: {e}"})
-
-        for coin in self.cfg["coins"]:
-            # skip unsupported coins cleanly
-            try:
-                if not self.client.supports(coin):
-                    continue
-            except Exception:
-                pass
-
-            # Use cached market data
-            if coin not in market_data_cache:
-                continue
-                
-            market_data = market_data_cache[coin]
-            best_bid = market_data["best_bid"]
-            best_ask = market_data["best_ask"]
-            
-            if best_bid <= 0 or best_ask <= 0:
-                continue
-
-            tick = self._effective_tick(coin, best_bid, best_ask)
-            step = float(self.client.sz_step(coin))
-            spread = best_ask - best_bid
-            mid = 0.5 * (best_bid + best_ask)
-            
-            spread_bps_live = (spread / max(mid, 1e-12)) * 10_000.0
-
-            # Maintain per-coin spread history and compute dynamic min_spread_bps
-            if self.cfg.get("dynamic_min_spread_enabled", True) and coin not in set(self.cfg.get("dynamic_min_spread_exclude", [])):
-                hist = self._spread_hist.setdefault(coin, [])
-                hist.append(spread_bps_live)
-                lookback = int(self.cfg.get("dynamic_min_spread_lookback_loops", 300))
-                if len(hist) > lookback:
-                    del hist[0:len(hist) - lookback]
-                upd_every = int(self.cfg.get("dynamic_min_spread_update_every_loops", 20))
-                if upd_every > 0 and (self.loop_i % upd_every == 0) and len(hist) >= max(10, int(0.2 * lookback)):
-                    p = float(self._cf(coin, "dynamic_min_spread_percentile", float(self.cfg.get("dynamic_min_spread_percentile", 0.6))))
-                    target_pctl = self._percentile(hist, p)
-                    base_min = float(self._c(coin, "min_spread_bps", float(self.cfg.get("min_spread_bps", 0.0))))
-                    target = max(base_min, round(target_pctl, 2) if target_pctl is not None else base_min)
-                    prev = float(self._dyn_min_spread.get(coin, base_min))
-                    hyst = float(self.cfg.get("dynamic_min_spread_hysteresis_bps", 0.5))
-                    if target > prev + hyst or target < prev - hyst:
-                        self._dyn_min_spread[coin] = target
-                        self._tlog({
-                            "type": "info",
-                            "op": "dynamic_min_spread",
-                            "coin": coin,
-                            "msg": f"min_spread_bps updated: {prev:.2f} → {target:.2f} (pctl {p*100:.0f} over {len(hist)} samples)"
-                        })
-
-            # Tiny telemetry print per coin at a low cadence
-            tel_every = int(self.cfg.get("dynamic_min_spread_telemetry_every_loops", 50))
-            if tel_every > 0 and (self.loop_i % tel_every == 0):
-                hist = self._spread_hist.get(coin, [])
-                p50 = self._percentile(hist, 0.5) if hist else None
-                p90 = self._percentile(hist, 0.9) if hist else None
-                base_min_spread_bps = self._cf(coin, "min_spread_bps", 0.0)
-                dyn_floor = float(self._dyn_min_spread.get(coin, base_min_spread_bps))
-                eff_min_spread_bps = max(base_min_spread_bps, dyn_floor)
-                be_mm_cache = getattr(self, "_be_mm_bps", None)
-                guard_buf = float(self._cf(coin, "min_spread_guard_buffer_bps", float(self.cfg.get("min_spread_guard_buffer_bps", 2.0))))
-                guard_floor = (be_mm_cache + guard_buf) if isinstance(be_mm_cache, (int, float)) else None
-                self._tlog({
-                    "type": "telemetry",
-                    "op": "spread",
-                    "coin": coin,
-                    "live_bps": round(spread_bps_live, 2),
-                    "p50_bps": None if p50 is None else round(p50, 2),
-                    "p90_bps": None if p90 is None else round(p90, 2),
-                    "eff_min_spread_bps": round(eff_min_spread_bps, 2),
-                    "guard_floor_bps": None if guard_floor is None else round(guard_floor, 2)
-                })
-
-            # Skip if market data is invalid
-            if best_bid <= 0 or best_ask <= 0 or spread <= 0:
-                self.log({"type": "warn", "coin": coin, "msg": f"Invalid market data: bid={best_bid}, ask={best_ask}, spread={spread}"})
-                continue
-
-            # min-spread gate (bps) with dynamic floor
-            base_min_spread_bps = self._cf(coin, "min_spread_bps", 0.0)
-            eff_min_spread_bps = base_min_spread_bps
-            dyn = self._dyn_min_spread.get(coin)
-            if dyn is not None:
-                eff_min_spread_bps = max(eff_min_spread_bps, float(dyn))
-            if eff_min_spread_bps > 0.0 and spread_bps_live < eff_min_spread_bps:
-                # Turn on to see the spread too tight to be profitable (coins will execute right after due to race condition and make profit)
-                # self.log({"type": "info", "coin": coin, "msg": f"Spread too tight to be profitable: {spread_bps_live:.2f} < {eff_min_spread_bps:.2f} bps"})
-                continue  # skip this coin this loop
-
-            # desired size (USD -> units), then round UP to size step
-            target_notional = self._cf(coin, "size_notional_usd", 100.0)
-            raw_units = max(1e-12, target_notional / max(mid, 1e-12))
-            size_units = round_up_units(raw_units, step)
-
-            # margin cap
-            size_units = self._cap_size_by_margin(coin, mid, size_units)
-            if size_units <= 0 or size_units < step:
-                continue
-
-            # enforce exchange minimum notional (e.g., $10)
-            min_usd = self._cf(coin, "exchange_min_order_usd", 10.0)
-            if mid * size_units < min_usd:
-                bump_units = round_up_units(min_usd / max(mid, 1e-12), step)
-                bumped = self._cap_size_by_margin(coin, mid, bump_units)
-                if bumped >= step and (bumped * mid) >= min_usd:
-                    size_units = bumped
-                else:
-                    self.log({"type":"warn","coin":coin,"msg":f"skip: below exchange min ${min_usd}, size={size_units}, mid={mid}"})
-                    continue
-
-            # current per-coin notional & position management
-            st = self.coin_state(coin)
-            notional = abs(st.pos) * mid
-            
-            # Take profit on large profitable positions first
-            if self._maybe_take_profit(coin):
-                # Position was closed, skip placing new orders for this coin
-                continue
-            
-            # Safety flatten if position too large
-            self.flatten_if_needed(coin, mid)
-            
-            # Enhanced bailout check for underwater positions
-            if self._enhanced_bailout_check(coin):
-                # Position was bailed out, skip placing new orders for this coin
-                continue
-
-            # Join or improve inside the spread with a 1-tick cushion when possible.
-            if spread >= 2.0 * tick:
-                # Improve by 1 tick but never cross the opposite touch
-                bid_px = min(best_ask - tick, best_bid + tick)
-                ask_px = max(best_bid + tick, best_ask - tick)
-            else:
-                # One-tick spread: just join at the touch to stay ALO-safe
-                bid_px = max(best_bid, 0.0001)
-                ask_px = best_ask
-
-            # Additional safety: ensure prices are reasonable
-            if bid_px <= 0 or ask_px <= 0:
-                self.log({"type": "warn", "coin": coin, "msg": f"Invalid prices calculated: bid={bid_px}, ask={ask_px}, best_bid={best_bid}, best_ask={best_ask}"})
-                continue
-
-            # Sanity check: ensure prices are within reasonable bounds of market
-            if bid_px > best_ask or ask_px < best_bid:
-                self.log({"type": "warn", "coin": coin, "msg": f"Prices outside market: bid={bid_px}, ask={ask_px}, best_bid={best_bid}, best_ask={best_ask}"})
-                continue
-
-            # inventory skew
-            inv_skew_ticks = int(self._c(coin, "inventory_skew_ticks", 0))
-            if inv_skew_ticks > 0 and coin not in ['PENGU', 'BIO']:
-                if st.pos > 0:  # long -> worsen bid
-                    bid_px = max(bid_px - inv_skew_ticks * tick, 0.0001)
-                elif st.pos < 0:  # short -> worsen ask
-                    ask_px = ask_px + inv_skew_ticks * tick
-
-            # join-then-improve if touch is stale (use adaptive tick size)
-            if coin not in ['PENGU', 'BIO']:
-                bid_px = self._maybe_improve("B", coin, bid_px, best_bid, best_ask, tick)
-                ask_px = self._maybe_improve("A", coin, ask_px, best_bid, best_ask, tick)
-
-            # Check single-sided mode and get optimal prices
-            allowed_side = self._get_single_side(coin)
-            
-            # Place orders based on single-sided mode with optimal pricing
-            if allowed_side == "B" and self._should_replace("B", coin, bid_px, tick) and notional < max_coin_cap and gross < max_gross_cap:
-                # Use market-aware logic for optimal bid price
-                optimal_bid_px = self._get_optimal_single_side_price(coin, "B", bid_px, tick, best_bid, best_ask)
-                if optimal_bid_px != bid_px:
-                    self.log({"type": "info", "op": "optimal_pricing", "coin": coin, "side": "B", "base_price": round(bid_px, 4), "optimal_price": round(optimal_bid_px, 4)})
-                batch_orders.append({
-                    "side": "B", 
-                    "coin": coin, 
-                    "price": optimal_bid_px, 
-                    "size": size_units,
-                    "best_bid": best_bid,
-                    "best_ask": best_ask
-                })
-                
-            elif allowed_side == "A" and self._should_replace("A", coin, ask_px, tick) and notional < max_coin_cap and gross < max_gross_cap:
-                # Use market-aware logic for optimal ask price
-                optimal_ask_px = self._get_optimal_single_side_price(coin, "A", ask_px, tick, best_bid, best_ask)
-                if optimal_ask_px != ask_px:
-                    self.log({"type": "info", "op": "optimal_pricing", "coin": coin, "side": "A", "base_price": round(ask_px, 4), "optimal_price": round(optimal_ask_px, 4)})
-                batch_orders.append({
-                    "side": "A", 
-                    "coin": coin, 
-                    "price": optimal_ask_px, 
-                    "size": size_units,
-                    "best_bid": best_bid,
-                    "best_ask": best_ask
-                })
-                
-            elif allowed_side == "N":
-                # No quote state - don't place any orders
-                pass
-                
-            elif allowed_side is None:
-                # Single-sided mode is off - place both sides (legacy behavior)
-                if self._should_replace("B", coin, bid_px, tick) and notional < max_coin_cap and gross < max_gross_cap:
-                    batch_orders.append({
-                        "side": "B", 
-                        "coin": coin, 
-                        "price": bid_px, 
-                        "size": size_units,
-                        "best_bid": best_bid,
-                        "best_ask": best_ask
-                    })
-                    
-                if self._should_replace("A", coin, ask_px, tick) and notional < max_coin_cap and gross < max_gross_cap:
-                    batch_orders.append({
-                        "side": "A", 
-                        "coin": coin, 
-                        "price": ask_px, 
-                        "size": size_units,
-                        "best_bid": best_bid,
-                        "best_ask": best_ask
-                    })
-
-        # Process batch orders if enabled
-        if self.cfg.get("batch_orders", True) and batch_orders:
-            # Place new orders in batch - IOC orders don't need cancellation
-            results = self._place_batch_orders(batch_orders)
-            
-            # Process results (IOC orders don't need tracking)
-            for i, result in enumerate(results):
-                if i < len(batch_orders):
-                    order = batch_orders[i]
-                    # Log successful order placement if needed
-                    if isinstance(result, dict) and result.get("status") == "ok":
-                        self._tlog({
-                            "type": "order", 
-                            "coin": order["coin"], 
-                            "side": order["side"], 
-                            "price": order["price"], 
-                            "size": order["size"], 
-                            "status": "placed"
-                        })
-        else:
-            # Fallback to individual order placement
-            for order in batch_orders:
-                self.place(order["side"], order["coin"], order["price"], order["size"], order["best_bid"], order["best_ask"])
+                    # Get current spread from WebSocket data
+                    if (self.client.use_websocket and 
+                        hasattr(self.client, 'ws_market_data') and 
+                        coin in self.client.ws_market_data.market_data):
+                        
+                        data = self.client.ws_market_data.market_data[coin]
+                        best_bid = data.get("best_bid", 0.0)
+                        best_ask = data.get("best_ask", 0.0)
+                        
+                        if best_bid > 0 and best_ask > 0:
+                            spread = best_ask - best_bid
+                            mid = 0.5 * (best_bid + best_ask)
+                            spread_bps_live = (spread / max(mid, 1e-12)) * 10_000.0
+                            
+                            # Update spread history
+                            if coin not in set(self.cfg.get("dynamic_min_spread_exclude", [])):
+                                hist = self._spread_hist.setdefault(coin, [])
+                                hist.append(spread_bps_live)
+                                lookback = int(self.cfg.get("dynamic_min_spread_lookback_loops", 300))
+                                if len(hist) > lookback:
+                                    del hist[0:len(hist) - lookback]
+                                
+                                # Update dynamic min_spread periodically
+                                upd_every = int(self.cfg.get("dynamic_min_spread_update_every_loops", 20))
+                                if upd_every > 0 and (self.loop_i % upd_every == 0) and len(hist) >= max(10, int(0.2 * lookback)):
+                                    p = float(self._cf(coin, "dynamic_min_spread_percentile", float(self.cfg.get("dynamic_min_spread_percentile", 0.6))))
+                                    target_pctl = self._percentile(hist, p)
+                                    base_min = float(self._c(coin, "min_spread_bps", float(self.cfg.get("min_spread_bps", 0.0))))
+                                    target = max(base_min, round(target_pctl, 2) if target_pctl is not None else base_min)
+                                    prev = float(self._dyn_min_spread.get(coin, base_min))
+                                    hyst = float(self.cfg.get("dynamic_min_spread_hysteresis_bps", 0.5))
+                                    if target > prev + hyst or target < prev - hyst:
+                                        self._dyn_min_spread[coin] = target
+                                        self._tlog({
+                                            "type": "info",
+                                            "op": "dynamic_min_spread",
+                                            "coin": coin,
+                                            "msg": f"min_spread_bps updated: {prev:.2f} → {target:.2f} (pctl {p*100:.0f} over {len(hist)} samples)"
+                                        })
+                            
+                            # Telemetry at low cadence
+                            tel_every = int(self.cfg.get("dynamic_min_spread_telemetry_every_loops", 50))
+                            if tel_every > 0 and (self.loop_i % tel_every == 0):
+                                hist = self._spread_hist.get(coin, [])
+                                p50 = self._percentile(hist, 0.5) if hist else None
+                                p90 = self._percentile(hist, 0.9) if hist else None
+                                base_min_spread_bps = self._cf(coin, "min_spread_bps", 0.0)
+                                dyn_floor = float(self._dyn_min_spread.get(coin, base_min_spread_bps))
+                                eff_min_spread_bps = max(base_min_spread_bps, dyn_floor)
+                                be_mm_cache = getattr(self, "_be_mm_bps", None)
+                                guard_buf = float(self._cf(coin, "min_spread_guard_buffer_bps", float(self.cfg.get("min_spread_guard_buffer_bps", 2.0))))
+                                guard_floor = (be_mm_cache + guard_buf) if isinstance(be_mm_cache, (int, float)) else None
+                                self._tlog({
+                                    "type": "telemetry",
+                                    "op": "spread",
+                                    "coin": coin,
+                                    "live_bps": round(spread_bps_live, 2),
+                                    "p50_bps": None if p50 is None else round(p50, 2),
+                                    "p90_bps": None if p90 is None else round(p90, 2),
+                                    "eff_min_spread_bps": round(eff_min_spread_bps, 2),
+                                    "guard_floor_bps": None if guard_floor is None else round(guard_floor, 2)
+                                })
+                except Exception as e:
+                    self.log({"type": "warn", "op": "spread_history_update", "coin": coin, "msg": str(e)})
 
     # ---------- portfolio risk management ----------
 

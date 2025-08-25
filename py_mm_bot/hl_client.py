@@ -112,6 +112,7 @@ class WebSocketMarketData:
         self.user_addr = user_addr
         self.user_fill_callbacks = []  # callbacks receiving raw WsFill dicts
         self.stop_event = asyncio.Event()  # Clean shutdown
+        self.order_callbacks = {}  # coin -> list of order placement callbacks
         # Note: WebSocket is only for market data, not for order placement
 
     async def _send(self, obj):
@@ -122,6 +123,13 @@ class WebSocketMarketData:
         """Register a callback to be invoked for each incoming user fill (raw WsFill)."""
         if callable(callback):
             self.user_fill_callbacks.append(callback)
+
+    def add_order_callback(self, coin: str, callback: Callable[[dict], None]):
+        """Register a callback to be invoked when market data updates for a coin."""
+        if callable(callback):
+            if coin not in self.order_callbacks:
+                self.order_callbacks[coin] = []
+            self.order_callbacks[coin].append(callback)
 
     async def _heartbeat(self):
         try:
@@ -314,14 +322,26 @@ class WebSocketMarketData:
                     bid_sz = float(bids[0].get("sz", 0.0)) if bids else 0.0
                     ask_sz = float(asks[0].get("sz", 0.0)) if asks else 0.0
                     if coin and best_bid > 0 and best_ask > 0:
-                        self.market_data[coin] = {
+                        market_data = {
                             "best_bid": best_bid,
                             "best_ask": best_ask,
                             "bid_sz": bid_sz,
                             "ask_sz": ask_sz,
                             "timestamp": time.time(),
                         }
-                        # Callbacks per coin
+                        self.market_data[coin] = market_data
+                        
+                        # Trigger order callbacks immediately for real-time trading
+                        if coin in self.order_callbacks:
+                            # Add coin name to market data for callback
+                            market_data_with_coin = {**market_data, "coin": coin}
+                            for cb in self.order_callbacks[coin]:
+                                try:
+                                    cb(market_data_with_coin)
+                                except Exception as e:
+                                    print(f"Order callback error for {coin}: {e}")
+                        
+                        # Legacy callbacks per coin
                         if coin in self.callbacks:
                             for cb in self.callbacks[coin]:
                                 try:
@@ -337,13 +357,25 @@ class WebSocketMarketData:
                     bid_sz = float((b or {}).get("sz", 0.0)) if b else 0.0
                     ask_sz = float((a or {}).get("sz", 0.0)) if a else 0.0
                     if coin and best_bid > 0 and best_ask > 0:
-                        self.market_data[coin] = {
+                        market_data = {
                             "best_bid": best_bid,
                             "best_ask": best_ask,
                             "bid_sz": bid_sz,
                             "ask_sz": ask_sz,
                             "timestamp": time.time(),
                         }
+                        self.market_data[coin] = market_data
+                        
+                        # Trigger order callbacks immediately for real-time trading
+                        if coin in self.order_callbacks:
+                            # Add coin name to market data for callback
+                            market_data_with_coin = {**market_data, "coin": coin}
+                            for cb in self.order_callbacks[coin]:
+                                try:
+                                    cb(market_data_with_coin)
+                                except Exception as e:
+                                    print(f"Order callback error for {coin}: {e}")
+                        
                         if coin in self.callbacks:
                             for cb in self.callbacks[coin]:
                                 try:
@@ -509,6 +541,11 @@ class HLClient:
         """Register a callback to receive raw WsFill dicts from the WS manager."""
         if self.use_websocket and hasattr(self, "ws_market_data") and self.ws_market_data:
             self.ws_market_data.add_user_fill_callback(callback)
+
+    def on_market_data_update(self, coin: str, callback: Callable[[dict], None]):
+        """Register a callback to receive real-time market data updates for a coin."""
+        if self.use_websocket and hasattr(self, "ws_market_data") and self.ws_market_data:
+            self.ws_market_data.add_order_callback(coin, callback)
 
     def fetch_recent_fills(self, limit: int = 100):
         """Fetch recent fills via HTTP Info and return the last `limit` items (raw dicts)."""

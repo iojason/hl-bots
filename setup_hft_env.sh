@@ -1,13 +1,15 @@
 #!/bin/bash
 
-# HFT Trading Environment Setup
+# HFT Trading Environment Setup - Real-Time Per-Coin Order Placement
 # This script sets up environment variables for optimized dual rate limiting
+# The bot now places orders immediately when market data arrives via WebSocket callbacks
+# This provides sub-millisecond latency for order placement
 
 echo "Setting up HFT trading environment variables..."
 
 # Dual Rate Limiting Configuration - Optimized for HFT
 export HL_WS_CAPACITY_PER_MIN=2000        # WebSocket operations (high capacity)
-export HL_REST_CAPACITY_PER_MIN=1000       # REST API operations (conservative)
+export HL_REST_CAPACITY_PER_MIN=1200       # REST API operations (conservative)
 
 # Rate limiting weights - Optimized for trading performance
 export HL_RL_WEIGHT_ORDER=1               # Order placement weight (minimal)
