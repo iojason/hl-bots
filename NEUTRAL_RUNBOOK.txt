@@ -1,0 +1,36 @@
+
+Neutral pack for market-aware single-sided quoting (no per-coin bias enabled).
+
+What’s included
+- fast_trading.json with:
+  • single_sided_mode: auto
+  • market-aware filters (spread floor excess, maker-share check, side bias via decayed maker fills)
+  • flip cooldown 150 loops (~30s at 200ms)
+  • neutral bias defaults (bias_enabled true but no per-coin bias_side set)
+  • bailout policy: partial at 30 bps after 90s underwater, full at 60 bps or 180s underwater
+  • tighter cancel/replace cadence (min_replace_ms 15 global; BTC 10, DOGE 15)
+
+How to keep it “like the wallet” but neutral
+- By default, the bot will only ever quote one side at a time per coin (single-sided auto).
+- It will rest only when spreads are favorable and maker share is healthy.
+- It won’t enforce direction per coin until you set per-coin bias in config.
+
+When you want to lock direction per coin
+- Add per-coin keys under per_coin.<COIN>:
+  • "bias_side": "long" | "short"
+  • "target_inventory_usd": (e.g., 10000)
+  • Optional: "inv_band_pct": 0.2–0.3
+
+Bailout overview
+- Partial reduce (33%) with IOC once MAE > 30 bps and you've been underwater >= 90s.
+- Full exit at MAE > 60 bps or underwater >= 180s; then pause quoting.
+- Spreads tight or maker-share weak => auto pause (no-quote) until conditions recover.
+
+Smoke test (suggested)
+1) Testnet, run for 60–120 minutes.
+2) Watch logs for 'ss_market_aware', 'single_sided_flip', and fills.
+3) Verify only one side is resting per coin at any moment.
+4) Confirm 'N' (no-quote) kicks in when spreads are tight.
+
+Scaling note
+- Start small. Increase per-coin caps only once maker share and net PnL are stable.

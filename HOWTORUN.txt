@@ -1,0 +1,71 @@
+# never commit these
+# main account address with funds on HL
+export HL_ACCOUNT_ADDRESS=0xYOUR_MAIN_WALLET_ADDRESS # Metamask, Rabby etc. 
+
+# API wallet private key from app.hyperliquid.xyz/API
+export HL_SECRET_KEY=0xYOUR_API_WALLET_PRIVATE_KEY
+
+
+A) Run each bot in its own process/terminal (each with its own env vars) but in same venv:
+
+# Run once
+python -m venv .venv #run once and use for all of them. 
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+#sanity check
+python -c "import hyperliquid, eth_account; print('SDK OK')"
+
+# Terminal 1
+source .venv/bin/activate
+export HL_ACCOUNT_ADDRESS=0xADDR_A
+export HL_SECRET_KEY=0xAPIKEY_A
+python -m py_mm_bot.run --db ./mm_data.db --config ./configs/strategy1.json
+
+
+# Terminal 2
+source .venv/bin/activate
+# each bot uses a different metamask wallet and hyperliquid api key
+export HL_ACCOUNT_ADDRESS=0xADDR_B
+export HL_SECRET_KEY=0xAPIKEY_B
+python -m py_mm_bot.run --db ./mm_data.db --config ./configs/strategy2.json
+
+# Terminal 3... etc
+
+# OR # one process, same wallet for all strategies (like many coins from same bot). 
+
+source .venv/bin/activate
+export HL_ACCOUNT_ADDRESS=0xYOUR_MAIN_WALLET_ADDRESS
+export HL_SECRET_KEY=0xYOUR_API_WALLET_PRIVATE_KEY
+
+# Sanity check before running real bot hitting exchange:
+python basic_order_gtc.py
+python taker_smoke_ioc.py
+
+# RUN BOT (ALL COINS)
+source .venv/bin/activate
+python -m py_mm_bot.run --db ./mm_data.db --config-dir ./configs/fast_trading.json
+
+# If you still see no fills: your quotes are too conservative. For a quick test, temporarily set:
+"size_notional_usd": 5,
+"peg_frac_of_spread": 0.05
+
+
+
+
+# TO SEE BOT TRADING LIVE
+https://testnet.hypurrscan.io/address/0x07Cf550BFB384487dea8F2EA7842BE931c9aDae7
+
+
+# TO SEE BOT TRADING DATA WITH DASHBOARD
+unzip hl-mm-dashboard.zip -d hl-mm-dashboard
+cd hl-mm-dashboard
+npm i
+# point the dashboard at the same SQLite file your bots are writing to
+MM_DB_PATH=/absolute/path/to/mm_data.db 
+npm start
+# then open http://localhost:3030
+
+
+
+
