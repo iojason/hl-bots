@@ -16,6 +16,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
 
+
 from .db import insert_latency
 
 # ---- Global REST rate limiter (token bucket) ----
@@ -95,29 +96,24 @@ class PingStat:
 
 
 class WebSocketMarketData:
-    """WebSocket-based market data and order placement for real-time updates without rate limits.
-    Follows Hyperliquid WS spec: method/subscribe + channel/data. Sends heartbeats.
-    """
+    """WebSocket-based market data using the official Hyperliquid SDK Info class."""
 
     def __init__(self, mode: str = "testnet", coins=None, user_addr: Optional[str] = None, exchange=None):
         self.mode = mode.lower()
-        self.ws_url = TESTNET_WS_URL if self.mode == "testnet" else MAINNET_WS_URL
-        self.websocket = None
-        self.market_data = {}   # coin -> {best_bid, best_ask, bid_sz, ask_sz, timestamp}
-        self.callbacks = {}
-        self.running = False
-        self.ws_ready = False  # Connection state flag (like SDK)
-        self.heartbeat_task = None
         self.coins = list(coins) if coins else ["ETH", "AVAX", "PENGU", "FARTCOIN"]
         self.user_addr = user_addr
+        self.market_data = {}   # coin -> {best_bid, best_ask, bid_sz, ask_sz, timestamp}
+        self.callbacks = {}
         self.user_fill_callbacks = []  # callbacks receiving raw WsFill dicts
-        self.stop_event = asyncio.Event()  # Clean shutdown
         self.order_callbacks = {}  # coin -> list of order placement callbacks
-        # Note: WebSocket is only for market data, not for order placement
-
-    async def _send(self, obj):
-        if self.websocket and self.ws_ready:
-            await self.websocket.send(json.dumps(obj))
+        
+        # Use the official SDK's Info class for WebSocket functionality
+        api_base = constants.TESTNET_API_URL if self.mode == "testnet" else constants.MAINNET_API_URL
+        self.info = Info(api_base, skip_ws=False)  # Enable WebSocket
+        
+        # Connection state
+        self.ws_ready = False
+        self.running = False
 
     def add_user_fill_callback(self, callback: Callable[[dict], None]):
         """Register a callback to be invoked for each incoming user fill (raw WsFill)."""
@@ -131,281 +127,108 @@ class WebSocketMarketData:
                 self.order_callbacks[coin] = []
             self.order_callbacks[coin].append(callback)
 
-    async def _heartbeat(self):
+    def _handle_market_data(self, data: dict):
+        """Handle market data from WebSocket subscriptions."""
         try:
-            while self.running and not self.stop_event.is_set():
-                try:
-                    if self.websocket and self.ws_ready:
-                        await self._send({"method": "ping"})
-                    else:
-                        # Wait longer when not connected
-                        await asyncio.sleep(5)
-                        continue
-                except Exception as e:
-                    print(f"Heartbeat failed: {e}")
-                    # Don't break on heartbeat failure, just continue
-                    await asyncio.sleep(5)
-                    continue
-                await asyncio.sleep(30)  # Send heartbeat every 30 seconds (safe margin before 60s timeout)
-        finally:
-            self.heartbeat_task = None
+            # Extract coin and market data from the message
+            coin = data.get("coin")
+            if not coin:
+                return
+                
+            # Handle different message types
+            if "levels" in data:  # l2Book data
+                levels = data.get("levels", [[], []])
+                bids = levels[0] if levels and isinstance(levels, list) else []
+                asks = levels[1] if levels and isinstance(levels, list) else []
+                best_bid = float(bids[0].get("px", 0.0)) if bids else 0.0
+                best_ask = float(asks[0].get("px", 0.0)) if asks else 0.0
+                bid_sz = float(bids[0].get("sz", 0.0)) if bids else 0.0
+                ask_sz = float(asks[0].get("sz", 0.0)) if asks else 0.0
+            elif "bbo" in data:  # bbo data
+                b, a = data.get("bbo", [None, None])
+                best_bid = float((b or {}).get("px", 0.0)) if b else 0.0
+                best_ask = float((a or {}).get("px", 0.0)) if a else 0.0
+                bid_sz = float((b or {}).get("sz", 0.0)) if b else 0.0
+                ask_sz = float((a or {}).get("sz", 0.0)) if a else 0.0
+            else:
+                return
+            
+            if best_bid > 0 and best_ask > 0:
+                market_data = {
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "bid_sz": bid_sz,
+                    "ask_sz": ask_sz,
+                    "timestamp": time.time(),
+                }
+                self.market_data[coin] = market_data
+                
+                # Debug: Log first market data received (only once)
+                if len(self.market_data) == 1:
+                    print(f"🎯 First WebSocket market data received: {coin} bid={best_bid:.4f} ask={best_ask:.4f}")
+                elif len(self.market_data) == len(self.coins) and not hasattr(self, '_all_coins_logged'):
+                    print(f"✅ All {len(self.coins)} coins now have WebSocket market data")
+                    self._all_coins_logged = True
+                
+                # Trigger order callbacks immediately for real-time trading
+                if coin in self.order_callbacks:
+                    market_data_with_coin = {**market_data, "coin": coin}
+                    for cb in self.order_callbacks[coin]:
+                        try:
+                            cb(market_data_with_coin)
+                        except Exception as e:
+                            print(f"Order callback error for {coin}: {e}")
+                
+                # Legacy callbacks per coin
+                if coin in self.callbacks:
+                    for cb in self.callbacks[coin]:
+                        try:
+                            cb(self.market_data[coin])
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"Error handling market data: {e}")
 
-    async def connect(self):
-        """Connect to WebSocket and subscribe to market data."""
+    def _handle_user_fills(self, data: dict):
+        """Handle user fills from WebSocket subscriptions."""
         try:
-            # Better connection parameters for stability
-            self.websocket = await websockets.connect(
-                self.ws_url,
-                ping_interval=30,
-                ping_timeout=10,
-                close_timeout=10,
-                max_size=2**20,  # 1MB max message size
-                compression=None  # Disable compression for lower latency
-            )
-            self.running = True
-            self.ws_ready = True
+            fills = data.get("fills", []) or []
+            for fill in fills:
+                for cb in list(self.user_fill_callbacks):
+                    try:
+                        cb(fill)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Error handling user fills: {e}")
 
-            # Wait a moment for connection to stabilize
-            await asyncio.sleep(0.1)
-
-            # Subscribe to l2Book and bbo for each configured coin (per spec)
+    def connect(self):
+        """Connect using the official SDK's Info class WebSocket functionality."""
+        try:
+            # Subscribe to market data for configured coins
             for coin in self.coins:
                 try:
-                    await self._send({
-                        "method": "subscribe",
-                        "subscription": {"type": "l2Book", "coin": coin}
-                    })
-                    await asyncio.sleep(0.05)  # Small delay between subscriptions
-                    await self._send({
-                        "method": "subscribe",
-                        "subscription": {"type": "bbo", "coin": coin}
-                    })
-                    await asyncio.sleep(0.05)  # Small delay between subscriptions
+                    # Subscribe to l2Book data
+                    self.info.subscribe({"type": "l2Book", "coin": coin}, self._handle_market_data)
+                    # Subscribe to bbo data
+                    self.info.subscribe({"type": "bbo", "coin": coin}, self._handle_market_data)
                 except Exception as e:
                     print(f"Failed to subscribe to {coin}: {e}")
-
-            # Subscribe to user-specific streams (fills, orders) if we have a user address
+            
+            # Subscribe to user fills if we have a user address
             if self.user_addr:
                 try:
-                    await self._send({
-                        "method": "subscribe",
-                        "subscription": {"type": "userFills", "user": self.user_addr}
-                    })
-                    await asyncio.sleep(0.05)
-                    await self._send({
-                        "method": "subscribe",
-                        "subscription": {"type": "orderUpdates", "user": self.user_addr}
-                    })
+                    self.info.subscribe({"type": "userFills", "user": self.user_addr}, self._handle_user_fills)
                 except Exception as e:
-                    print(f"Failed to subscribe to user streams: {e}")
-
-            # Start listening and heartbeat
-            asyncio.create_task(self._listen())
-            if self.heartbeat_task is None:
-                self.heartbeat_task = asyncio.create_task(self._heartbeat())
-            print(f"WebSocket connected to {self.ws_url}")
+                    print(f"Failed to subscribe to user fills: {e}")
+            
+            self.running = True
+            self.ws_ready = True
+            print(f"✅ WebSocket subscriptions created using official SDK Info class")
         except Exception as e:
-            print(f"WebSocket connection failed: {e}")
+            print(f"WebSocket subscription failed: {e}")
             self.ws_ready = False
-            self.websocket = None
-
-    async def _listen(self):
-        """Listen for market data updates."""
-        reconnect_delay = 1.0
-        max_reconnect_delay = 30.0
-        consecutive_failures = 0
-        
-        while self.running:
-            try:
-                # Check if we need to connect or reconnect
-                if not self.websocket or not self.ws_ready:
-                    # Wait before reconnecting to avoid spam
-                    await asyncio.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-                    consecutive_failures += 1
-                    
-                    try:
-                        print(f"Attempting WebSocket reconnection (attempt {consecutive_failures})...")
-                        self.websocket = await websockets.connect(
-                            self.ws_url,
-                            ping_interval=30,  # Match our heartbeat interval
-                            ping_timeout=15,   # Increased timeout
-                            close_timeout=15,  # Increased timeout
-                            max_size=2**20,
-                            compression=None
-                        )
-                        self.ws_ready = True
-                        reconnect_delay = 1.0  # Reset delay on successful connection
-                        consecutive_failures = 0
-                        
-                        # Wait for connection to stabilize
-                        await asyncio.sleep(0.2)
-                        
-                        # Resubscribe to all channels
-                        for coin in self.coins:
-                            try:
-                                await self._send({
-                                    "method": "subscribe",
-                                    "subscription": {"type": "l2Book", "coin": coin}
-                                })
-                                await asyncio.sleep(0.05)
-                                await self._send({
-                                    "method": "subscribe",
-                                    "subscription": {"type": "bbo", "coin": coin}
-                                })
-                                await asyncio.sleep(0.05)
-                            except Exception as e:
-                                print(f"Failed to resubscribe to {coin}: {e}")
-                        
-                        if self.user_addr:
-                            try:
-                                await self._send({
-                                    "method": "subscribe",
-                                    "subscription": {"type": "userFills", "user": self.user_addr}
-                                })
-                                await asyncio.sleep(0.05)
-                                await self._send({
-                                    "method": "subscribe",
-                                    "subscription": {"type": "orderUpdates", "user": self.user_addr}
-                                })
-                            except Exception as e:
-                                print(f"Failed to resubscribe to user streams: {e}")
-                        
-                        print(f"WebSocket reconnected to {self.ws_url}")
-                    except Exception as e:
-                        print(f"WebSocket reconnection failed: {e}")
-                        self.ws_ready = False
-                        self.websocket = None
-                        if consecutive_failures > 5:
-                            print(f"Too many consecutive failures ({consecutive_failures}), waiting longer...")
-                            await asyncio.sleep(10)
-                        continue
-                
-                # Receive messages with timeout that's less than server's 60s timeout
-                try:
-                    raw = await asyncio.wait_for(self.websocket.recv(), timeout=50.0)  # Less than 60s server timeout
-                    msg = json.loads(raw)
-                except asyncio.TimeoutError:
-                    # Timeout is normal, just continue listening
-                    continue
-                except websockets.exceptions.ConnectionClosed:
-                    print("WebSocket connection closed, will reconnect...")
-                    self.ws_ready = False
-                    self.websocket = None
-                    continue
-                except websockets.exceptions.WebSocketException as e:
-                    print(f"WebSocket exception: {e}")
-                    self.ws_ready = False
-                    self.websocket = None
-                    continue
-                except json.JSONDecodeError as e:
-                    print(f"Invalid JSON received: {e}")
-                    continue
-
-                ch = msg.get("channel")
-                if ch == "subscriptionResponse":
-                    # ack, can be ignored or logged
-                    pass
-                elif ch == "pong":
-                    # heartbeat response
-                    pass
-                elif ch == "error":
-                    print(f"WebSocket error: {msg}")
-                elif ch == "l2Book":
-                    book = msg.get("data", {})
-                    coin = book.get("coin")
-                    levels = book.get("levels", [[], []])
-                    bids = levels[0] if levels and isinstance(levels, list) else []
-                    asks = levels[1] if levels and isinstance(levels, list) else []
-                    best_bid = float(bids[0].get("px", 0.0)) if bids else 0.0
-                    best_ask = float(asks[0].get("px", 0.0)) if asks else 0.0
-                    bid_sz = float(bids[0].get("sz", 0.0)) if bids else 0.0
-                    ask_sz = float(asks[0].get("sz", 0.0)) if asks else 0.0
-                    if coin and best_bid > 0 and best_ask > 0:
-                        market_data = {
-                            "best_bid": best_bid,
-                            "best_ask": best_ask,
-                            "bid_sz": bid_sz,
-                            "ask_sz": ask_sz,
-                            "timestamp": time.time(),
-                        }
-                        self.market_data[coin] = market_data
-                        
-                        # Trigger order callbacks immediately for real-time trading
-                        if coin in self.order_callbacks:
-                            # Add coin name to market data for callback
-                            market_data_with_coin = {**market_data, "coin": coin}
-                            for cb in self.order_callbacks[coin]:
-                                try:
-                                    cb(market_data_with_coin)
-                                except Exception as e:
-                                    print(f"Order callback error for {coin}: {e}")
-                        
-                        # Legacy callbacks per coin
-                        if coin in self.callbacks:
-                            for cb in self.callbacks[coin]:
-                                try:
-                                    cb(self.market_data[coin])
-                                except Exception:
-                                    pass
-                elif ch == "bbo":
-                    data = msg.get("data", {})
-                    coin = data.get("coin")
-                    b, a = data.get("bbo", [None, None])
-                    best_bid = float((b or {}).get("px", 0.0)) if b else 0.0
-                    best_ask = float((a or {}).get("px", 0.0)) if a else 0.0
-                    bid_sz = float((b or {}).get("sz", 0.0)) if b else 0.0
-                    ask_sz = float((a or {}).get("sz", 0.0)) if a else 0.0
-                    if coin and best_bid > 0 and best_ask > 0:
-                        market_data = {
-                            "best_bid": best_bid,
-                            "best_ask": best_ask,
-                            "bid_sz": bid_sz,
-                            "ask_sz": ask_sz,
-                            "timestamp": time.time(),
-                        }
-                        self.market_data[coin] = market_data
-                        
-                        # Trigger order callbacks immediately for real-time trading
-                        if coin in self.order_callbacks:
-                            # Add coin name to market data for callback
-                            market_data_with_coin = {**market_data, "coin": coin}
-                            for cb in self.order_callbacks[coin]:
-                                try:
-                                    cb(market_data_with_coin)
-                                except Exception as e:
-                                    print(f"Order callback error for {coin}: {e}")
-                        
-                        if coin in self.callbacks:
-                            for cb in self.callbacks[coin]:
-                                try:
-                                    cb(self.market_data[coin])
-                                except Exception:
-                                    pass
-                elif ch == "userFills":
-                    data = msg.get("data", {})
-                    fills = data.get("fills", []) or []
-                    # Stream each fill to registered callbacks
-                    for f in fills:
-                        for cb in list(self.user_fill_callbacks):
-                            try:
-                                cb(f)
-                            except Exception:
-                                pass
-                # Note: WebSocket is only for market data, not for order placement
-                # Order updates and responses are handled via REST API
-                else:
-                    # Print the first few unknown messages for visibility
-                    if len(self.market_data) < 2:
-                        print(f"WebSocket message: {msg}")
-            except websockets.exceptions.ConnectionClosed:
-                print("WebSocket connection closed, will reconnect...")
-                self.ws_ready = False
-                await asyncio.sleep(reconnect_delay)
-            except Exception as e:
-                print(f"WebSocket error: {e}")
-                self.ws_ready = False
-                await asyncio.sleep(reconnect_delay)
+            self.running = False
 
     def get_best_bid_ask(self, coin: str) -> Tuple[float, float]:
         """Get cached best bid/ask from WebSocket data."""
@@ -419,9 +242,7 @@ class WebSocketMarketData:
 
     def supports_ws_orders(self) -> bool:
         """Check if WebSocket market data is supported and working."""
-        return (self.ws_ready and 
-                self.websocket and 
-                bool(self.market_data))  # Market data indicates connection is working
+        return self.ws_ready and bool(self.market_data)  # Market data indicates connection is working
 
     def subscribe(self, coin: str, callback: Callable = None):
         """Subscribe to updates for a specific coin at runtime."""
@@ -430,32 +251,16 @@ class WebSocketMarketData:
         if callback:
             self.callbacks.setdefault(coin, []).append(callback)
         # Fire and forget subscription if already connected
-        if self.ws_ready and self.websocket:
-            asyncio.create_task(self._send({
-                "method": "subscribe",
-                "subscription": {"type": "l2Book", "coin": coin}
-            }))
+        if self.ws_ready and self.info:
+            self.info.subscribe({"type": "l2Book", "coin": coin}, self._handle_market_data)
+            self.info.subscribe({"type": "bbo", "coin": coin}, self._handle_market_data)
 
     def disconnect(self):
         """Clean shutdown of WebSocket connection."""
         self.running = False
-
-    # Note: WebSocket is only for market data, not for order placement
-    # Orders must use the SDK's exchange.order() method with proper signing
         self.ws_ready = False
-        self.stop_event.set()
-        
-        if self.heartbeat_task:
-            self.heartbeat_task.cancel()
-            self.heartbeat_task = None
-            
-        if self.websocket:
-            try:
-                # Close WebSocket properly - use create_task for async close
-                asyncio.create_task(self.websocket.close())
-            except Exception:
-                pass
-            self.websocket = None
+
+
 
 
 class HLClient:
@@ -501,20 +306,7 @@ class HLClient:
         # WebSocket market data
         if self.use_websocket:
             self.ws_market_data = WebSocketMarketData(self.mode, coins=coins, user_addr=addr)
-            # Run the asyncio event loop in a background thread so WS tasks keep running
-            self.loop = asyncio.new_event_loop()
-            self.loop_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
-            self.loop_thread.start()
-            # Kick off connect coroutine on the background loop
-            fut = asyncio.run_coroutine_threadsafe(self.ws_market_data.connect(), self.loop)
-            try:
-                fut.result(timeout=3)
-            except Exception:
-                pass
-            # Warm wait briefly for first WS data to reduce early HTTP fallbacks
-            t0_wait = time.time()
-            while time.time() - t0_wait < 3.0 and not self.ws_market_data.market_data:
-                time.sleep(0.05)
+            print("✅ WebSocket market data initialized using official SDK")
         # runtime stats & caches
         self.ping = PingStat()
         # Prevent repeated WS fallback logs per coin
@@ -523,8 +315,8 @@ class HLClient:
         self._meta: Optional[dict] = None
         self._name_to_meta: Dict[str, dict] = {}
         # --- shared REST rate limiter (process-wide) ---
-        ws_cap = int(os.environ.get("HL_WS_CAPACITY_PER_MIN", "1800"))
-        rest_cap = int(os.environ.get("HL_REST_CAPACITY_PER_MIN", "800"))
+        ws_cap = int(os.environ.get("HL_WS_CAPACITY_PER_MIN", "2000"))
+        rest_cap = int(os.environ.get("HL_REST_CAPACITY_PER_MIN", "1200"))
         if not hasattr(HLClient, "_dual_rl") or HLClient._dual_rl is None:
             HLClient._dual_rl = _DualRateLimiter(ws_cap, rest_cap)
         self._dual_rl = HLClient._dual_rl
@@ -715,7 +507,7 @@ class HLClient:
             else:
                 # WebSocket data not warm yet; log once per coin then fall back to HTTP
                 if coin not in self._ws_fallback_once:
-                    print(f"WebSocket data invalid for {coin}, falling back to HTTP")
+                    print(f"⏳ WebSocket warming up for {coin}, using HTTP fallback")
                     self._ws_fallback_once.add(coin)
         
         # Fallback to HTTP (respect global limiter) - only if WebSocket fails

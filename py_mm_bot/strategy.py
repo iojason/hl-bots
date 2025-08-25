@@ -512,7 +512,35 @@ class MarketMaker:
             if not ws_connected:
                 self.log({"type": "warn", "op": "websocket", "msg": "WebSocket not connected, will use REST fallback"})
             else:
-                self.log({"type": "info", "op": "websocket", "msg": "WebSocket connected and ready"})
+                # Log detailed WebSocket status
+                market_data_count = len(self.client.ws_market_data.market_data)
+                coins_with_data = list(self.client.ws_market_data.market_data.keys())
+                
+                # Show real-time market data if available
+                if market_data_count > 0:
+                    market_data_summary = {}
+                    for coin in coins_with_data[:3]:  # Show first 3 coins
+                        data = self.client.ws_market_data.market_data.get(coin, {})
+                        if data:
+                            market_data_summary[coin] = {
+                                "bid": round(data.get("best_bid", 0), 4),
+                                "ask": round(data.get("best_ask", 0), 4),
+                                "age_ms": round((time.time() - data.get("timestamp", 0)) * 1000, 0)
+                            }
+                    
+                    self.log({
+                        "type": "info", 
+                        "op": "websocket", 
+                        "msg": f"WebSocket connected and ready with {market_data_count} coins",
+                        "coins": coins_with_data,
+                        "market_data_sample": market_data_summary
+                    })
+                else:
+                    self.log({
+                        "type": "info", 
+                        "op": "websocket", 
+                        "msg": f"WebSocket connected but waiting for market data (ws_ready={self.client.ws_market_data.ws_ready})"
+                    })
 
         # Optional: purge all open orders for configured coins to avoid stacking from prior runs
         if self.cfg.get("purge_on_start", True):
@@ -1680,209 +1708,6 @@ class MarketMaker:
             
         except Exception as e:
             self.log({"type": "error", "op": "single_order_realtime", "coin": coin, "side": side, "msg": str(e)})
-
-        is_buy = side == "B"
-
-        # steps
-        tick = d(adaptive_tick) if adaptive_tick is not None else d(self._effective_tick(coin, best_bid, best_ask))
-        step = d(self.client.sz_step(coin))
-
-        # clamp to touch and nudge if 1-tick spread
-        bb = d(best_bid); ba = d(best_ask)
-        px = d(price)
-        if is_buy:
-            if px >= ba:
-                px = ba - tick
-            if (ba - bb) <= tick and px >= ba:
-                px = ba - tick
-        else:
-            if px <= bb:
-                px = bb + tick
-            if (ba - bb) <= tick and px <= bb:
-                px = bb + tick
-
-        # quantize price (down for buy, up for sell) and size (DOWN to preserve cap)
-        px_q = quantize_down(px, tick) if is_buy else quantize_up(px, tick)
-        sz_q = quantize_down(d(size), step)
-
-        # Safety: ensure quantized price is not zero
-        if px_q <= 0:
-            min_price = max(float(px) * 0.5, float(tick) * 0.1, 0.0001)
-            px_q = d(min_price)
-
-        # final guard vs initial touch
-        if is_buy and px_q >= ba:
-            px_q = quantize_down(ba - tick, tick)
-        if (not is_buy) and px_q <= bb:
-            px_q = quantize_up(bb + tick, tick)
-
-        # wire as <= 8 dp floats
-        px_f = as_float_8dp(px_q)
-        sz_f = as_float_8dp(sz_q)
-
-        # self.log({"type": "debug", "coin": coin, "msg": f"tick_used={tick}, px_f={px_f}, sz_f={sz_f}"})
-
-        # Preflight: refresh BBO to avoid ALO race conditions and ensure 1-tick cushion
-        try:
-            bb2, ba2 = self.client.best_bid_ask(coin)
-        except Exception:
-            bb2, ba2 = float(best_bid), float(best_ask)
-
-        # If our price would cross on the refreshed book, pull it back by 1 tick
-        if is_buy and px_f >= ba2:
-            px_f = as_float_8dp(quantize_down(d(ba2) - tick, tick))
-        elif (not is_buy) and px_f <= bb2:
-            px_f = as_float_8dp(quantize_up(d(bb2) + tick, tick))
-
-        # Validate price before sending order
-        if px_f <= 0:
-            self._log_lifecycle(coin, side, sz_f, px_f, "ERROR:Invalid price (<= 0)")
-            self.log({"type": "error", "op": "place", "coin": coin, "msg": f"Invalid price: {px_f} (must be > 0)"})
-            return
-
-        self._log_lifecycle(coin, side, sz_f, px_f, "NEW")
-        oid = ""
-
-        attempt = 0
-        while attempt < 2:
-            try:
-                res = self.client.place_post_only({"coin": coin, "is_buy": is_buy, "sz": sz_f, "px": px_f})
-
-                # If response is a string, treat as error message
-                if isinstance(res, str):
-                    msg = res
-                    if msg == "RATE_LIMITED":
-                        # gracefully skip this cycle; limiter protected us
-                        self._log_lifecycle(coin, side, sz_f, px_f, "SKIP:RATE_LIMITED")
-                        return
-
-                    if "Post only order would have immediately matched" in msg and attempt == 0:
-                        # reprice with fresh BBO and a 1-tick cushion, then retry
-                        try:
-                            bb3, ba3 = self.client.best_bid_ask(coin)
-                        except Exception:
-                            bb3, ba3 = float(best_bid), float(best_ask)
-                        bb3d, ba3d = d(bb3), d(ba3)
-                        if is_buy:
-                            px_q2 = quantize_down(min(ba3d - tick, bb3d), tick)
-                        else:
-                            px_q2 = quantize_up(max(bb3d + tick, ba3d), tick)
-                        px_f = as_float_8dp(px_q2)
-                        attempt += 1
-                        continue
-
-                    if "Insufficient margin" in msg and attempt == 0:
-                        new_sz = quantize_down(d(sz_f) * Decimal("0.5"), step)
-                        if new_sz <= Decimal("0"):
-                            self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:{msg}")
-                            self.log({"type": "error", "op": "place", "coin": coin, "msg": f"{msg} (price: {px_f}, size: {sz_f})"})
-                            return
-                        sz_f = as_float_8dp(new_sz)
-                        attempt += 1
-                        continue
-                    self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:{msg}")
-                    self.log({"type": "error", "op": "place", "coin": coin, "msg": f"{msg} (price: {px_f}, size: {sz_f})"})
-                    return
-
-                # If response is a dict, parse common shapes
-                if isinstance(res, dict):
-                    st = res.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-                    if "resting" in st:
-                        oid = str(st["resting"].get("oid", ""))
-                    elif "placed" in st and "oid" in st["placed"]:
-                        oid = str(st["placed"]["oid"])
-                    elif "error" in st:
-                        msg = st["error"]
-                        if msg == "RATE_LIMITED":
-                            self._log_lifecycle(coin, side, sz_f, px_f, "SKIP:RATE_LIMITED")
-                            return
-
-                        if "Post only order would have immediately matched" in msg and attempt == 0:
-                            # reprice with fresh BBO and a 1-tick cushion, then retry
-                            try:
-                                bb3, ba3 = self.client.best_bid_ask(coin)
-                            except Exception:
-                                bb3, ba3 = float(best_bid), float(best_ask)
-                            bb3d, ba3d = d(bb3), d(ba3)
-                            if is_buy:
-                                px_q2 = quantize_down(min(ba3d - tick, bb3d), tick)
-                            else:
-                                px_q2 = quantize_up(max(bb3d + tick, ba3d), tick)
-                            px_f = as_float_8dp(px_q2)
-                            attempt += 1
-                            continue
-
-                        if "Insufficient margin" in msg and attempt == 0:
-                            new_sz = quantize_down(d(sz_f) * Decimal("0.5"), step)
-                            if new_sz <= Decimal("0"):
-                                self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:{msg}")
-                                self.log({"type": "error", "op": "place", "coin": coin, "msg": f"{msg} (price: {px_f}, size: {sz_f})"})
-                                return
-                            sz_f = as_float_8dp(new_sz)
-                            attempt += 1
-                            continue
-                        self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:{msg}")
-                        self.log({"type": "error", "op": "place", "coin": coin, "msg": f"{msg} (price: {px_f}, size: {sz_f})"})
-                        return
-                    else:
-                        self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:Unexpected response format")
-                        self.log({"type": "error", "op": "place", "coin": coin, "msg": f"Unexpected response format: {res}"})
-                        return
-                else:
-                    self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:Invalid response type")
-                    self.log({"type": "error", "op": "place", "coin": coin, "msg": f"Invalid response type: {type(res)}"})
-                    return
-
-                # Success
-                self._log_lifecycle(coin, side, sz_f, px_f, "ACCEPTED", oid)
-                # Log order placement briefly
-                self._tlog({"type": "order", "coin": coin, "side": side, "price": px_f, "size": sz_f, "status": "placed"})
-                break
-            except Exception as e:
-                msg = str(e)
-                if ("RemoteDisconnected" in msg or "Connection aborted" in msg) and attempt == 0:
-                    # transient network hiccup: reconnect and retry once
-                    try:
-                        self.client.connect()
-                    except Exception:
-                        pass
-                    time.sleep(0.05)
-                    attempt += 1
-                    continue
-
-                if "Post only order would have immediately matched" in msg and attempt == 0:
-                    try:
-                        bb3, ba3 = self.client.best_bid_ask(coin)
-                    except Exception:
-                        bb3, ba3 = float(best_bid), float(best_ask)
-                    bb3d, ba3d = d(bb3), d(ba3)
-                    if is_buy:
-                        px_q2 = quantize_down(min(ba3d - tick, bb3d), tick)
-                    else:
-                        px_q2 = quantize_up(max(bb3d + tick, ba3d), tick)
-                    px_f = as_float_8dp(px_q2)
-                    attempt += 1
-                    continue
-
-                if "Insufficient margin" in msg and attempt == 0:
-                    new_sz = quantize_down(d(sz_f) * Decimal("0.5"), step)
-                    if new_sz <= Decimal("0"):
-                        self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:{msg}")
-                        self.log({"type": "error", "op": "place", "coin": coin, "msg": f"{msg} (price: {px_f}, size: {sz_f})"})
-                        return
-                    sz_f = as_float_8dp(new_sz)
-                    attempt += 1
-                    continue
-                self._log_lifecycle(coin, side, sz_f, px_f, f"ERROR:{msg}")
-                self.log({"type": "error", "op": "place", "coin": coin, "msg": f"{msg} (price: {px_f}, size: {sz_f})"})
-                return
-
-        # remember oid and last price for cancel/replace
-        key = (coin, side)
-        if oid:
-            self.last_oid[key] = oid
-        self.last_px[key] = float(px_f)
-        self.last_ts[key] = time.time()
 
     def place(self, side: str, coin: str, price: float, size: float, best_bid: float, best_ask: float, adaptive_tick: float = None):
         # Place the new quote (quantized, ALO-safe) - IOC orders don't need cancellation
