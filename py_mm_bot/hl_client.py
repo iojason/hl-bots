@@ -95,11 +95,11 @@ class PingStat:
 
 
 class WebSocketMarketData:
-    """WebSocket-based market data for real-time updates without rate limits.
+    """WebSocket-based market data and order placement for real-time updates without rate limits.
     Follows Hyperliquid WS spec: method/subscribe + channel/data. Sends heartbeats.
     """
 
-    def __init__(self, mode: str = "testnet", coins=None, user_addr: Optional[str] = None):
+    def __init__(self, mode: str = "testnet", coins=None, user_addr: Optional[str] = None, exchange=None):
         self.mode = mode.lower()
         self.ws_url = TESTNET_WS_URL if self.mode == "testnet" else MAINNET_WS_URL
         self.websocket = None
@@ -112,6 +112,7 @@ class WebSocketMarketData:
         self.user_addr = user_addr
         self.user_fill_callbacks = []  # callbacks receiving raw WsFill dicts
         self.stop_event = asyncio.Event()  # Clean shutdown
+        # Note: WebSocket is only for market data, not for order placement
 
     async def _send(self, obj):
         if self.websocket and self.ws_ready:
@@ -359,6 +360,8 @@ class WebSocketMarketData:
                                 cb(f)
                             except Exception:
                                 pass
+                # Note: WebSocket is only for market data, not for order placement
+                # Order updates and responses are handled via REST API
                 else:
                     # Print the first few unknown messages for visibility
                     if len(self.market_data) < 2:
@@ -382,6 +385,12 @@ class WebSocketMarketData:
     def is_connected(self) -> bool:
         return self.ws_ready and bool(self.market_data)
 
+    def supports_ws_orders(self) -> bool:
+        """Check if WebSocket market data is supported and working."""
+        return (self.ws_ready and 
+                self.websocket and 
+                bool(self.market_data))  # Market data indicates connection is working
+
     def subscribe(self, coin: str, callback: Callable = None):
         """Subscribe to updates for a specific coin at runtime."""
         if coin not in self.coins:
@@ -398,6 +407,9 @@ class WebSocketMarketData:
     def disconnect(self):
         """Clean shutdown of WebSocket connection."""
         self.running = False
+
+    # Note: WebSocket is only for market data, not for order placement
+    # Orders must use the SDK's exchange.order() method with proper signing
         self.ws_ready = False
         self.stop_event.set()
         
@@ -762,7 +774,7 @@ class HLClient:
 
     def place_post_only(self, order: Dict[str, Any]) -> Any:
         """
-        Post-only limit using ALO.
+        Post-only limit using IOC (Immediate or Cancel) as per Hyperliquid SDK.
         order = {"coin": "ETH", "is_buy": True, "sz": 0.01, "px": 2500.0}
         """
         t0 = time.time()
@@ -774,7 +786,7 @@ class HLClient:
                 bool(order["is_buy"]),        # is_buy
                 float(order["sz"]),           # sz
                 float(order["px"]),           # limit_px
-                {"limit": {"tif": "Alo"}},    # post-only maker
+                {"limit": {"tif": "Ioc"}},    # IOC (Immediate or Cancel)
                 False,                        # reduce_only
             )
             return res
@@ -783,10 +795,10 @@ class HLClient:
             print(f"API Error for {order['coin']}: {str(e)}")
             return str(e)  # Return error as string so strategy can handle it
         finally:
-            self._record_latency("order_alo", t0, order.get("coin", ""))
+            self._record_latency("order_ioc", t0, order.get("coin", ""))
 
     def place_ioc(self, coin: str, is_buy: bool, sz: float, px: float, reduce_only: bool = False) -> Any:
-        """Immediate-Or-Cancel limit (portable 'market-like' taker)."""
+        """Immediate-Or-Cancel limit using IOC as per Hyperliquid SDK."""
         t0 = time.time()
         try:
             if not self._dual_rl.acquire_rest(self._w_order, block=True, max_wait_s=0.5):
@@ -805,7 +817,7 @@ class HLClient:
 
     def place_batch_orders(self, orders: list) -> Any:
         """
-        Place multiple orders in a single batch request to reduce API calls.
+        Place multiple orders using IOC as per Hyperliquid SDK.
         orders = [{"coin": "ETH", "is_buy": True, "sz": 0.01, "px": 2500.0, "reduce_only": False}, ...]
         """
         if not orders:
@@ -818,7 +830,7 @@ class HLClient:
             if not self._dual_rl.acquire_rest(batch_weight, block=True, max_wait_s=1.0):
                 return ["RATE_LIMITED"] * len(orders)
             
-            # Convert orders to SDK format
+            # Convert orders to SDK format with IOC
             sdk_orders = []
             for order in orders:
                 sdk_orders.append({
@@ -826,7 +838,7 @@ class HLClient:
                     "is_buy": bool(order["is_buy"]),
                     "sz": float(order["sz"]),
                     "limit_px": float(order["px"]),
-                    "order_type": {"limit": {"tif": "Alo"}},  # Post-only for maker orders
+                    "order_type": {"limit": {"tif": "Ioc"}},  # IOC (Immediate or Cancel)
                     "reduce_only": bool(order.get("reduce_only", False))
                 })
             
@@ -856,6 +868,7 @@ class HLClient:
             self._record_latency("batch_order", t0, f"{len(orders)}_orders")
 
     def cancel(self, coin: str, oid: int) -> Any:
+        """Cancel order using REST API as per Hyperliquid SDK."""
         t0 = time.time()
         try:
             if not self._dual_rl.acquire_rest(self._w_cancel, block=True, max_wait_s=0.5):

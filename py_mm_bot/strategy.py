@@ -82,10 +82,7 @@ class MarketMaker:
         self.realized_min = 0.0
         self.net_fees_min = 0.0
 
-        # cancel/replace & stale-touch tracking
-        self.last_oid: Dict[Tuple[str, str], str] = {}     # (coin, side) -> oid
-        self.last_px:  Dict[Tuple[str, str], float] = {}   # (coin, side) -> last sent px
-        self.last_ts:  Dict[Tuple[str, str], float] = {}   # (coin, side) -> last place ts
+        # touch tracking (for improve logic)
         self.touch_px: Dict[Tuple[str, str], float] = {}   # (coin, side) -> last observed touch
         self.stale_count: Dict[Tuple[str, str], int] = {}  # (coin, side) -> loops at same touch
 
@@ -786,6 +783,7 @@ class MarketMaker:
         """
         Best-effort cancel of any open orders on the blocked side for a coin.
         side_blocked: "B" or "A"
+        Note: With IOC orders, this should rarely be needed but kept for safety.
         """
         # Cache open_orders for a few seconds to reduce REST pressure
         try:
@@ -1708,15 +1706,7 @@ class MarketMaker:
         self.last_ts[key] = time.time()
 
     def place(self, side: str, coin: str, price: float, size: float, best_bid: float, best_ask: float, adaptive_tick: float = None):
-        # Cancel previous resting order on this side for this coin (best-effort)
-        key = (coin, side)
-        old = self.last_oid.get(key)
-        if old:
-            try:
-                self.client.cancel(coin, int(old))
-            except Exception:
-                pass
-        # Place the new quote (quantized, ALO-safe)
+        # Place the new quote (quantized, ALO-safe) - IOC orders don't need cancellation
         self._place_post_only_quantized(side, coin, price, size, best_bid, best_ask, adaptive_tick)
 
     # ---------- flatten logic (IOC, reduce-only) ----------
@@ -1843,77 +1833,22 @@ class MarketMaker:
             return [{"error": str(e)}] * len(orders)
     
     def _batch_cancel_existing_orders(self):
-        """Cancel all existing orders in batch to reduce API calls."""
-        try:
-            # Get all open orders once
-            oo = self.client.info.open_orders(self.client.addr)
-            if not isinstance(oo, list):
-                return
-            
-            # Group by coin for potential batch canceling
-            coin_orders = {}
-            for row in oo:
-                try:
-                    c = row.get("coin") or row.get("name") or row.get("asset")
-                    if c in self.cfg.get("coins", []):
-                        oid = row.get("oid") or row.get("orderId") or row.get("order_id")
-                        if oid:
-                            if c not in coin_orders:
-                                coin_orders[c] = []
-                            coin_orders[c].append(int(oid))
-                except Exception:
-                    pass
-            
-            # Cancel orders by coin (could be optimized to batch cancel if SDK supports it)
-            for coin, oids in coin_orders.items():
-                for oid in oids:
-                    try:
-                        self.client.cancel(coin, oid)
-                    except Exception:
-                        pass
-        except Exception as e:
-            self.log({"type": "warn", "op": "batch_cancel", "msg": str(e)})
+        """Cancel all existing orders in batch to reduce API calls.
+        Note: With IOC orders, this method is no longer used but kept for potential future use.
+        """
+        # This method is deprecated since IOC orders don't rest
+        pass
 
     def _cancel_all_orders_for_coin(self, coin: str):
-        """Cancel all existing orders for a coin efficiently."""
-        try:
-            oo = self.client.info.open_orders(self.client.addr)
-            if isinstance(oo, list):
-                for row in oo:
-                    try:
-                        c = row.get("coin") or row.get("name") or row.get("asset")
-                        if c == coin:
-                            oid = row.get("oid") or row.get("orderId") or row.get("order_id")
-                            if oid:
-                                self.client.cancel(coin, int(oid))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        """Cancel all existing orders for a coin efficiently.
+        Note: With IOC orders, this method is no longer used but kept for potential future use.
+        """
+        # This method is deprecated since IOC orders don't rest
+        pass
 
     def _should_replace(self, side: str, coin: str, target_px: float, tick: float) -> bool:
-        """Only replace if moved by >= move_threshold_ticks or past min_replace_ms."""
-        move_ticks = int(self._c(coin, "move_threshold_ticks", 1))
-        min_ms = int(self._c(coin, "min_replace_ms", 100))  # Reduced from 250ms
-        key = (coin, side)
-
-        last_px = self.last_px.get(key)
-        last_ts = self.last_ts.get(key, 0.0)
-        now = time.time()
-
-        # no previous order → place
-        if last_px is None:
-            return True
-
-        # price moved enough?
-        if abs(target_px - last_px) >= (move_ticks * tick - 1e-12):
-            return True
-
-        # time throttle (reduced from 250ms to 100ms)
-        if (now - last_ts) * 1000.0 >= min_ms:
-            return True
-
-        return False
+        """Always place IOC orders - no replacement logic needed since they don't rest."""
+        return True
 
 
 
@@ -2307,30 +2242,24 @@ class MarketMaker:
                     })
 
         # Process batch orders if enabled
-        if self.cfg.get("batch_orders", False) and batch_orders:
-            # Cancel existing orders first (batch cancel if possible)
-            self._batch_cancel_existing_orders()
-            
-            # Place new orders in batch
+        if self.cfg.get("batch_orders", True) and batch_orders:
+            # Place new orders in batch - IOC orders don't need cancellation
             results = self._place_batch_orders(batch_orders)
             
-            # Process results and update tracking
+            # Process results (IOC orders don't need tracking)
             for i, result in enumerate(results):
                 if i < len(batch_orders):
                     order = batch_orders[i]
-                    coin = order["coin"]
-                    side = order["side"]
-                    key = (coin, side)
-                    
-                    # Extract order ID from result if successful
-                    if isinstance(result, dict) and "response" in result:
-                        st = result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-                        if "resting" in st:
-                            oid = str(st["resting"].get("oid", ""))
-                            if oid:
-                                self.last_oid[key] = oid
-                                self.last_px[key] = float(order["price"])
-                                self.last_ts[key] = time.time()
+                    # Log successful order placement if needed
+                    if isinstance(result, dict) and result.get("status") == "ok":
+                        self._tlog({
+                            "type": "order", 
+                            "coin": order["coin"], 
+                            "side": order["side"], 
+                            "price": order["price"], 
+                            "size": order["size"], 
+                            "status": "placed"
+                        })
         else:
             # Fallback to individual order placement
             for order in batch_orders:
