@@ -3,7 +3,7 @@
   "name": "Fast Trading Strategy - WebSocket",
   "mode": "testnet",
   "wallet_address": "0x07Cf550BFB384487dea8F2EA7842BE931c9aDae7",
-  "config_version": "2.0.0",
+  "config_version": "2.1.0",
   "coins": [
     "BTC",
     "DOGE",
@@ -11,7 +11,7 @@
     "SOL",
     "kSHIB"
   ],
-  "loop_ms": 300,
+  "loop_ms": 500,
   "flatten_on_start": false,
   "flatten_max_spread_bps": 50,
   "flatten_max_slippage_bps": 6,
@@ -19,7 +19,7 @@
   "flatten_reduce_only": true,
   "purge_on_start": true,
   "move_threshold_ticks": 1,
-  "min_replace_ms": 300,
+  "min_replace_ms": 500,
   "improve_one_tick": false,
   "improve_stale_ticks": 2,
   "inventory_skew_ticks": 0,
@@ -29,7 +29,7 @@
   "maker_tier_bps": 1.0,
   "size_notional_usd": 25,
   "max_per_coin_notional": 400,
-  "max_gross_notional": 800,
+  "max_gross_notional": 2000,
   "min_spread_bps": 3.0,
   "use_websocket": true,
   "single_sided_mode": "off",
@@ -44,6 +44,13 @@
   "order_batch_size": 1,
   "market_data_update_freq": 1,
   "assumed_leverage": 10,
+  
+  "market_data": {
+    "refresh_interval_ms": 1000,
+    "max_age_ms": 5000,
+    "fallback_to_http": true,
+    "websocket_priority": true
+  },
   "margin_cap_fraction": 0.2,
   "min_spread_guard_enabled": true,
   "min_spread_guard_buffer_bps": 1.0,
@@ -81,6 +88,15 @@
   "bailout_pause_seconds": 30,
   "emergency_stop_loss_pct": -0.15,
   "portfolio_pause_threshold_pct": -0.08,
+  
+  "risk_management": {
+    "max_drawdown_bps": 500,
+    "stop_loss_bps": 200,
+    "take_profit_bps": 100,
+    "emergency_stop_loss_bps": 1000,
+    "position_size_limit_pct": 0.1,
+    "max_concurrent_positions": 5
+  },
   "emergency_take_profit_enabled": true,
   "emergency_take_profit_min_usd": 25.0,
   "telemetry_enabled": true,            
@@ -89,7 +105,23 @@
   "fills_log_enabled": true,            
   "lifecycle_log_enabled": false,
   "fc_probe_log": false,                 
-  "ss_market_aware_log_sample_s": 0,   
+  "ss_market_aware_log_sample_s": 0,
+  
+  "logging": {
+    "level": "INFO",
+    "log_orders": true,
+    "log_positions": true,
+    "log_pnl": true,
+    "log_flow_analysis": true,
+    "log_rate_limits": true,
+    "log_websocket_status": true
+  },
+  
+  "flow_analysis_short_window_s": 60,
+  "flow_analysis_medium_window_s": 600,
+  "flow_analysis_long_window_s": 3600,
+  "order_book_flow_update_interval_s": 2,
+  "flow_imbalance_update_interval_s": 10,   
   "take_profit_min_bps": 30.0,
   "take_profit_min_usd": 50.0,
   "enhanced_take_profit_enabled": true,  
@@ -98,7 +130,7 @@
       "bias_side": "auto",
       "target_inventory_usd": 300,
       "inv_band_pct": 0.25,
-      "config_version": "1.0.1",
+      "config_version": "1.1.0",
       "size_notional_usd": 100,
       "max_per_coin_notional": 500,
       "max_gross_notional": 500,
@@ -107,55 +139,79 @@
       "inventory_skew_ticks": 1,
       "take_profit_min_bps": 50.0,
       "take_profit_min_usd": 200.0,
-      "flatten_max_spread_bps": 20
+      "flatten_max_spread_bps": 20,
+      "flow_analysis_enabled": true,
+      "order_book_flow_weight": 1.2,
+      "flow_imbalance_weight": 0.8
     },
     "DOGE": {
       "bias_side": "auto",
       "target_inventory_usd": 90,
       "inv_band_pct": 0.25,
-      "config_version": "1.0.1",
+      "config_version": "1.1.0",
       "size_notional_usd": 100,
       "max_per_coin_notional": 150,
       "max_gross_notional": 150,
       "min_spread_bps": 3.0,
       "min_replace_ms": 15,
-      "inventory_skew_ticks": 1
+      "inventory_skew_ticks": 1,
+      "take_profit_min_bps": 5.0,
+      "take_profit_min_usd": 50.0,
+      "enhanced_take_profit_enabled": true,
+      "flow_analysis_enabled": true,
+      "order_book_flow_weight": 1.0,
+      "flow_imbalance_weight": 0.6
     },
     "HYPE": {
       "bias_side": "auto",
-      "config_version": "1.0.1",
+      "config_version": "1.1.0",
       "size_notional_usd": 100,
-      "max_per_coin_notional": 120,
-      "max_gross_notional": 120,
+      "max_per_coin_notional": 2000,
+      "max_gross_notional": 2000,
       "min_spread_bps": 3.5,
       "min_replace_ms": 25,
       "inventory_skew_ticks": 1,
       "flatten_max_spread_bps": 3000,
       "take_profit_min_bps": 5.0,
       "take_profit_min_usd": 50.0,
-      "enhanced_take_profit_enabled": true
+      "enhanced_take_profit_enabled": true,
+      "flow_analysis_enabled": true,
+      "order_book_flow_weight": 0.8,
+      "flow_imbalance_weight": 0.4
     },
     "SOL": {
       "bias_side": "auto",
       "target_inventory_usd": 240,
       "inv_band_pct": 0.25,
-      "config_version": "1.0.1",
+      "config_version": "1.1.0",
       "size_notional_usd": 100,
       "max_per_coin_notional": 400,
       "max_gross_notional": 400,
       "min_spread_bps": 3.0,
       "min_replace_ms": 15,
-      "inventory_skew_ticks": 1
+      "inventory_skew_ticks": 1,
+      "take_profit_min_bps": 5.0,
+      "take_profit_min_usd": 50.0,
+      "enhanced_take_profit_enabled": true,
+      "flow_analysis_enabled": true,
+      "order_book_flow_weight": 1.1,
+      "flow_imbalance_weight": 0.7
     },
     "kSHIB": {
       "bias_side": "auto",
-      "config_version": "1.0.1",
+      "config_version": "1.1.0",
       "size_notional_usd": 100,
-      "max_per_coin_notional": 100,
-      "max_gross_notional": 100,
+      "max_per_coin_notional": 200,
+      "max_gross_notional": 200,
       "min_spread_bps": 3.0,
       "min_replace_ms": 20,
-      "inventory_skew_ticks": 1
+      "inventory_skew_ticks": 1,
+      "take_profit_min_bps": 5.0,
+      "take_profit_min_usd": 50.0,
+      "enhanced_take_profit_enabled": true,
+      "flow_analysis_enabled": true,
+      "order_book_flow_weight": 0.9,
+      "flow_imbalance_weight": 0.5
     }
   }
 }

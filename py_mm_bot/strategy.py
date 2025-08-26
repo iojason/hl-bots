@@ -3,7 +3,7 @@ import time
 import math
 import datetime
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 import os
@@ -178,6 +178,30 @@ class MarketMaker:
         # coin -> {"mb": maker-buys (sells hit our bid), "ms": maker-sells (buyers lift our ask),
         #          "maker": total maker fills, "taker": total taker fills, "ts": last update epoch}
         self._ma_flow: Dict[str, Dict[str, float]] = {}
+        
+        # Order book flow analysis
+        # coin -> {"bid_volume": float, "ask_volume": float, "bid_orders": int, "ask_orders": int,
+        #          "large_orders": list, "imbalance": float, "pressure": float, "ts": float}
+        self._order_book_flow: Dict[str, Dict[str, Any]] = {}
+        
+        # Order book depth tracking
+        # coin -> {"bids": [(price, size), ...], "asks": [(price, size), ...], "ts": float}
+        self._order_book_depth: Dict[str, Dict[str, Any]] = {}
+        
+        # Flow imbalance detection
+        # coin -> {"bid_imbalance": float, "ask_imbalance": float, "net_imbalance": float, "ts": float}
+        self._flow_imbalance: Dict[str, Dict[str, float]] = {}
+        
+        # Flow analysis timeframes and configuration
+        self.cfg.setdefault("flow_analysis_short_window_s", 30)    # 30 seconds for short-term flow
+        self.cfg.setdefault("flow_analysis_medium_window_s", 300)  # 5 minutes for medium-term flow
+        self.cfg.setdefault("flow_analysis_long_window_s", 1800)   # 30 minutes for long-term flow
+        self.cfg.setdefault("order_book_flow_update_interval_s", 1) # Update order book flow every 1 second
+        self.cfg.setdefault("flow_imbalance_update_interval_s", 5)  # Update flow imbalance every 5 seconds
+        
+        # Flow analysis update tracking
+        self._last_order_book_flow_update: Dict[str, float] = {}
+        self._last_flow_imbalance_update: Dict[str, float] = {}
 
         # --- directional bias & bailout policy (global; per-coin via _c) ---
         # Bias state machine: accumulate (toward target) vs distribute (work out at a rebate)
@@ -905,6 +929,366 @@ class MarketMaker:
         st = self._ma_decay(coin)
         return float(st["mb"]), float(st["ms"]), float(st["maker"]), float(st["taker"])
 
+    # ---------- Order Book Flow Analysis ----------
+
+    def _analyze_order_book_flow(self, coin: str, order_book: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Comprehensive order book flow analysis.
+        Analyzes bid/ask imbalance, large orders, and order book pressure.
+        """
+        try:
+            bids = order_book.get("bids", [])
+            asks = order_book.get("asks", [])
+            
+            if not bids or not asks:
+                return {}
+            
+            # Calculate basic metrics
+            bid_volume = sum(float(bid[1]) for bid in bids)
+            ask_volume = sum(float(ask[1]) for ask in asks)
+            bid_orders = len(bids)
+            ask_orders = len(asks)
+            
+            # Calculate imbalance
+            total_volume = bid_volume + ask_volume
+            imbalance = (bid_volume - ask_volume) / max(total_volume, 1e-12)
+            
+            # Detect large orders (orders > 2x average size)
+            avg_bid_size = bid_volume / max(bid_orders, 1)
+            avg_ask_size = ask_volume / max(ask_orders, 1)
+            
+            large_orders = []
+            for side, orders in [("bid", bids), ("ask", asks)]:
+                for price, size in orders:
+                    size_float = float(size)
+                    avg_size = avg_bid_size if side == "bid" else avg_ask_size
+                    if size_float > avg_size * 2.0:
+                        large_orders.append({
+                            "side": side,
+                            "price": float(price),
+                            "size": size_float,
+                            "ratio": size_float / avg_size
+                        })
+            
+            # Calculate order book pressure
+            # Pressure = weighted average of order sizes by price level
+            bid_pressure = 0.0
+            ask_pressure = 0.0
+            
+            for i, (price, size) in enumerate(bids[:5]):  # Top 5 levels
+                weight = 1.0 / (i + 1)  # Higher weight for closer levels
+                bid_pressure += float(size) * weight
+                
+            for i, (price, size) in enumerate(asks[:5]):  # Top 5 levels
+                weight = 1.0 / (i + 1)  # Higher weight for closer levels
+                ask_pressure += float(size) * weight
+            
+            net_pressure = bid_pressure - ask_pressure
+            
+            # Calculate spread and depth
+            best_bid = float(bids[0][0]) if bids else 0.0
+            best_ask = float(asks[0][0]) if asks else 0.0
+            spread = best_ask - best_bid
+            mid = 0.5 * (best_bid + best_ask)
+            spread_bps = (spread / max(mid, 1e-12)) * 10000.0
+            
+            # Depth analysis (volume within X bps of mid)
+            depth_bps = 10.0  # 10 bps depth
+            depth_range = mid * depth_bps / 10000.0
+            
+            bid_depth = sum(float(bid[1]) for bid in bids if best_bid - float(bid[0]) <= depth_range)
+            ask_depth = sum(float(ask[1]) for ask in asks if float(ask[0]) - best_ask <= depth_range)
+            
+            result = {
+                "bid_volume": bid_volume,
+                "ask_volume": ask_volume,
+                "bid_orders": bid_orders,
+                "ask_orders": ask_orders,
+                "imbalance": imbalance,
+                "large_orders": large_orders,
+                "bid_pressure": bid_pressure,
+                "ask_pressure": ask_pressure,
+                "net_pressure": net_pressure,
+                "spread_bps": spread_bps,
+                "bid_depth": bid_depth,
+                "ask_depth": ask_depth,
+                "depth_imbalance": (bid_depth - ask_depth) / max(bid_depth + ask_depth, 1e-12),
+                "ts": time.time()
+            }
+            
+            # Store for historical analysis
+            self._order_book_flow[coin] = result
+            return result
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "order_book_flow_analysis", "coin": coin, "msg": str(e)})
+            return {}
+
+    def _detect_flow_imbalance(self, coin: str, fills: List[Dict[str, Any]], window_seconds: int = 300) -> Dict[str, float]:
+        """
+        Detect flow imbalance from recent fills within a time window.
+        Returns imbalance metrics for bid/ask flow.
+        """
+        try:
+            if not fills:
+                return {"bid_imbalance": 0.0, "ask_imbalance": 0.0, "net_imbalance": 0.0}
+            
+            # Filter fills by time window
+            cutoff_time = time.time() - window_seconds
+            recent_fills = [fill for fill in fills if fill.get("timestamp", 0) >= cutoff_time]
+            
+            bid_volume = 0.0
+            ask_volume = 0.0
+            bid_count = 0
+            ask_count = 0
+            
+            for fill in recent_fills:
+                side = fill.get("side", "").upper()
+                size = float(fill.get("size", 0))
+                
+                if side == "B":  # Buy
+                    bid_volume += size
+                    bid_count += 1
+                elif side == "A":  # Sell
+                    ask_volume += size
+                    ask_count += 1
+            
+            total_volume = bid_volume + ask_volume
+            total_count = bid_count + ask_count
+            
+            if total_volume == 0:
+                return {"bid_imbalance": 0.0, "ask_imbalance": 0.0, "net_imbalance": 0.0}
+            
+            bid_imbalance = bid_volume / total_volume
+            ask_imbalance = ask_volume / total_volume
+            net_imbalance = bid_imbalance - ask_imbalance
+            
+            result = {
+                "bid_imbalance": bid_imbalance,
+                "ask_imbalance": ask_imbalance,
+                "net_imbalance": net_imbalance,
+                "bid_count": bid_count,
+                "ask_count": ask_count,
+                "total_volume": total_volume,
+                "ts": time.time()
+            }
+            
+            # Store for historical analysis
+            self._flow_imbalance[coin] = result
+            return result
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "flow_imbalance_detection", "coin": coin, "msg": str(e)})
+            return {"bid_imbalance": 0.0, "ask_imbalance": 0.0, "net_imbalance": 0.0}
+
+    def _get_order_book_flow_signals(self, coin: str) -> Dict[str, Any]:
+        """
+        Get comprehensive order book flow signals for trading decisions using multiple timeframes.
+        """
+        try:
+            # Check if we should update order book flow analysis
+            if not self._should_update_flow_analysis(coin, "order_book"):
+                # Return cached results if available
+                cached = getattr(self, f"_cached_flow_signals_{coin}", None)
+                if cached and (time.time() - cached.get("timestamp", 0)) < 10:  # Cache for 10 seconds
+                    return cached.get("data", {})
+            
+            # Get current order book
+            order_book = self.client.get_order_book(coin)
+            if not order_book:
+                return {}
+            
+            # Analyze order book flow
+            flow_analysis = self._analyze_order_book_flow(coin, order_book)
+            
+            # Get recent fills for flow imbalance analysis
+            recent_fills = []
+            try:
+                # Get fills from multiple time windows
+                short_window = self.cfg.get("flow_analysis_short_window_s", 30)
+                medium_window = self.cfg.get("flow_analysis_medium_window_s", 300)
+                long_window = self.cfg.get("flow_analysis_long_window_s", 1800)
+                
+                # Get fills from database for the longest window
+                fills = self.db.execute(
+                    "SELECT * FROM fills WHERE coin = ? AND t_fill_ms >= ? ORDER BY t_fill_ms DESC",
+                    (coin, int((time.time() - long_window) * 1000))
+                ).fetchall()
+                
+                for fill in fills:
+                    recent_fills.append({
+                        "side": fill[3],  # side column
+                        "size": fill[4],  # size column
+                        "price": fill[5],  # price column
+                        "timestamp": fill[8] / 1000.0  # Convert ms to seconds
+                    })
+            except Exception:
+                pass
+            
+            # Analyze flow imbalance for multiple timeframes
+            short_imbalance = self._detect_flow_imbalance(coin, recent_fills, short_window)
+            medium_imbalance = self._detect_flow_imbalance(coin, recent_fills, medium_window)
+            long_imbalance = self._detect_flow_imbalance(coin, recent_fills, long_window)
+            
+            # Combine signals with multi-timeframe analysis
+            signals = {
+                "order_book_imbalance": flow_analysis.get("imbalance", 0.0),
+                "net_pressure": flow_analysis.get("net_pressure", 0.0),
+                "depth_imbalance": flow_analysis.get("depth_imbalance", 0.0),
+                "large_orders": len(flow_analysis.get("large_orders", [])),
+                "spread_bps": flow_analysis.get("spread_bps", 0.0),
+                "bid_volume": flow_analysis.get("bid_volume", 0.0),
+                "ask_volume": flow_analysis.get("ask_volume", 0.0),
+                # Multi-timeframe flow imbalances
+                "flow_imbalance_short": short_imbalance.get("net_imbalance", 0.0),
+                "flow_imbalance_medium": medium_imbalance.get("net_imbalance", 0.0),
+                "flow_imbalance_long": long_imbalance.get("net_imbalance", 0.0),
+                # Timeframe metadata
+                "short_window_s": short_window,
+                "medium_window_s": medium_window,
+                "long_window_s": long_window
+            }
+            
+            # Generate trading signals
+            trading_signals = {
+                "bid_strength": 0.0,
+                "ask_strength": 0.0,
+                "overall_bias": "neutral",
+                "confidence": 0.0
+            }
+            
+            # Calculate bid strength using multi-timeframe analysis (positive values favor bids)
+            bid_strength = 0.0
+            
+            # Order book signals (real-time)
+            bid_strength += flow_analysis.get("imbalance", 0.0) * 2.0  # Order book imbalance
+            bid_strength += flow_analysis.get("net_pressure", 0.0) / max(flow_analysis.get("bid_volume", 1.0), 1.0)  # Pressure
+            
+            # Multi-timeframe flow signals (weighted by recency)
+            bid_strength += short_imbalance.get("net_imbalance", 0.0) * 0.5   # Short-term (30s) - 50% weight
+            bid_strength += medium_imbalance.get("net_imbalance", 0.0) * 0.3   # Medium-term (5m) - 30% weight
+            bid_strength += long_imbalance.get("net_imbalance", 0.0) * 0.2     # Long-term (30m) - 20% weight
+            
+            # Calculate ask strength (positive values favor asks)
+            ask_strength = -bid_strength  # Inverse relationship
+            
+            trading_signals["bid_strength"] = bid_strength
+            trading_signals["ask_strength"] = ask_strength
+            
+            # Determine overall bias
+            if bid_strength > 0.1:
+                trading_signals["overall_bias"] = "bid"
+                trading_signals["confidence"] = min(1.0, abs(bid_strength))
+            elif ask_strength > 0.1:
+                trading_signals["overall_bias"] = "ask"
+                trading_signals["confidence"] = min(1.0, abs(ask_strength))
+            else:
+                trading_signals["overall_bias"] = "neutral"
+                trading_signals["confidence"] = 0.0
+            
+            # Log flow analysis periodically with multi-timeframe data
+            if self.loop_i % 60 == 0:  # Every minute
+                self._tlog({
+                    "type": "info",
+                    "op": "order_book_flow",
+                    "coin": coin,
+                    "order_book_imbalance": round(flow_analysis.get("imbalance", 0.0), 3),
+                    "net_pressure": round(flow_analysis.get("net_pressure", 0.0), 2),
+                    "flow_imbalance_30s": round(short_imbalance.get("net_imbalance", 0.0), 3),
+                    "flow_imbalance_5m": round(medium_imbalance.get("net_imbalance", 0.0), 3),
+                    "flow_imbalance_30m": round(long_imbalance.get("net_imbalance", 0.0), 3),
+                    "large_orders": len(flow_analysis.get("large_orders", [])),
+                    "bias": trading_signals["overall_bias"],
+                    "confidence": round(trading_signals["confidence"], 2),
+                    "timeframes": f"{short_window}s/{medium_window}s/{long_window}s"
+                })
+            
+            result = {**signals, **trading_signals}
+            
+            # Cache the results
+            setattr(self, f"_cached_flow_signals_{coin}", {
+                "data": result,
+                "timestamp": time.time()
+            })
+            
+            return result
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "order_book_flow_signals", "coin": coin, "msg": str(e)})
+            return {}
+
+    def _should_update_flow_analysis(self, coin: str, analysis_type: str = "order_book") -> bool:
+        """
+        Check if flow analysis should be updated based on configured intervals.
+        """
+        try:
+            now = time.time()
+            
+            if analysis_type == "order_book":
+                interval = self.cfg.get("order_book_flow_update_interval_s", 1)
+                last_update = self._last_order_book_flow_update.get(coin, 0.0)
+            else:  # flow_imbalance
+                interval = self.cfg.get("flow_imbalance_update_interval_s", 5)
+                last_update = self._last_flow_imbalance_update.get(coin, 0.0)
+            
+            if (now - last_update) >= interval:
+                # Update the timestamp
+                if analysis_type == "order_book":
+                    self._last_order_book_flow_update[coin] = now
+                else:
+                    self._last_flow_imbalance_update[coin] = now
+                return True
+            
+            return False
+            
+        except Exception:
+            return True  # Default to updating if check fails
+
+    def _should_adjust_quotes_for_flow(self, coin: str, side: str, base_price: float, tick: float) -> float:
+        """
+        Adjust quote prices based on order book flow analysis.
+        Returns adjusted price.
+        """
+        try:
+            flow_signals = self._get_order_book_flow_signals(coin)
+            if not flow_signals:
+                return base_price
+            
+            # Get flow-based adjustments
+            bid_strength = flow_signals.get("bid_strength", 0.0)
+            ask_strength = flow_signals.get("ask_strength", 0.0)
+            confidence = flow_signals.get("confidence", 0.0)
+            
+            # Only adjust if confidence is high enough
+            if confidence < 0.3:
+                return base_price
+            
+            # Calculate adjustment in ticks
+            max_adjustment_ticks = 2  # Maximum 2 tick adjustment
+            adjustment_ticks = confidence * max_adjustment_ticks
+            
+            if side == "B":  # Bid side
+                if bid_strength > 0.1:  # Strong bid flow
+                    # Be more aggressive (higher bid)
+                    return base_price + (adjustment_ticks * tick)
+                elif ask_strength > 0.1:  # Strong ask flow
+                    # Be less aggressive (lower bid)
+                    return base_price - (adjustment_ticks * tick)
+                    
+            elif side == "A":  # Ask side
+                if ask_strength > 0.1:  # Strong ask flow
+                    # Be more aggressive (lower ask)
+                    return base_price - (adjustment_ticks * tick)
+                elif bid_strength > 0.1:  # Strong bid flow
+                    # Be less aggressive (higher ask)
+                    return base_price + (adjustment_ticks * tick)
+            
+            return base_price
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "flow_price_adjustment", "coin": coin, "side": side, "msg": str(e)})
+            return base_price
+
     def _current_spread_bps(self, coin: str) -> float:
         """Compute current spread in basis points using freshest BBO."""
         try:
@@ -1601,6 +1985,7 @@ class MarketMaker:
                 return
             
             # Log successful placement
+            print(f"🚀 ORDER PLACED: {coin} {side} {sz_f} @ {px_f}")
             self._tlog({
                 "type": "order_placed",
                 "coin": coin,
@@ -1618,6 +2003,7 @@ class MarketMaker:
         try:
             # Skip if market data is invalid
             if best_bid <= 0 or best_ask <= 0:
+                print(f"❌ Invalid market data for {coin}: bid={best_bid}, ask={best_ask}")
                 return
             
             spread = best_ask - best_bid
@@ -1636,6 +2022,7 @@ class MarketMaker:
             if dyn is not None:
                 eff_min_spread_bps = max(eff_min_spread_bps, float(dyn))
             if eff_min_spread_bps > 0.0 and spread_bps_live < eff_min_spread_bps:
+                print(f"❌ Spread too tight for {coin}: {spread_bps_live:.1f}bps < {eff_min_spread_bps}bps")
                 return  # skip this coin this update
             
             # desired size (USD -> units), then round UP to size step
@@ -1646,6 +2033,7 @@ class MarketMaker:
             # margin cap
             size_units = self._cap_size_by_margin(coin, mid, size_units)
             if size_units <= 0 or size_units < step:
+                print(f"❌ Size too small for {coin}: {size_units} <= {step}")
                 return
             
             # enforce exchange minimum notional (e.g., $10)
@@ -1676,6 +2064,7 @@ class MarketMaker:
             
             # Take profit on large profitable positions first
             if self._maybe_take_profit(coin):
+                print(f"💰 Taking profit on {coin}, skipping new orders")
                 return  # Position was closed, skip placing new orders
             
             # Safety flatten if position too large
@@ -1683,6 +2072,7 @@ class MarketMaker:
             
             # Enhanced bailout check for underwater positions
             if self._enhanced_bailout_check(coin):
+                print(f"🚨 Bailing out {coin}, skipping new orders")
                 return  # Position was bailed out, skip placing new orders
             
             # Join or improve inside the spread with a 1-tick cushion when possible.
@@ -1716,6 +2106,10 @@ class MarketMaker:
                 bid_px = self._maybe_improve("B", coin, bid_px, best_bid, best_ask, tick)
                 ask_px = self._maybe_improve("A", coin, ask_px, best_bid, best_ask, tick)
             
+            # Adjust prices based on order book flow analysis
+            bid_px = self._should_adjust_quotes_for_flow(coin, "B", bid_px, tick)
+            ask_px = self._should_adjust_quotes_for_flow(coin, "A", ask_px, tick)
+            
             # Check single-sided mode and get optimal prices
             allowed_side = self._get_single_side(coin)
             
@@ -1737,8 +2131,11 @@ class MarketMaker:
             elif allowed_side is None:
                 # Single-sided mode is off - place both sides
                 if notional < max_coin_cap and gross < max_gross_cap:
+                    print(f"📈 Placing orders for {coin}: bid={bid_px:.4f}, ask={ask_px:.4f}, size={size_units}")
                     self._place_single_order_realtime(coin, "B", bid_px, size_units, best_bid, best_ask)
                     self._place_single_order_realtime(coin, "A", ask_px, size_units, best_bid, best_ask)
+                else:
+                    print(f"❌ Caps exceeded for {coin}: notional={notional:.1f}/{max_coin_cap}, gross={gross:.1f}/{max_gross_cap}")
                     
         except Exception as e:
             self.log({"type": "error", "op": "realtime_order_placement", "coin": coin, "msg": str(e)})
@@ -2403,7 +2800,7 @@ class MarketMaker:
             st = self.coin_state(coin)
             inv_bias = "A" if st.pos > 0 else ("B" if st.pos < 0 else None)
             
-            # Get flow bias
+            # Get flow bias from maker/taker fills
             mb, ms, mk, tk = self._ma_get(coin)
             bias_ratio = float(self._c(coin, "ss_ma_side_bias_ratio", self.cfg.get("ss_ma_side_bias_ratio", 1.15)))
             flow_bias = None
@@ -2411,6 +2808,18 @@ class MarketMaker:
                 flow_bias = "B"
             elif ms > mb * bias_ratio:
                 flow_bias = "A"
+            
+            # Get order book flow bias
+            order_book_flow = self._get_order_book_flow_signals(coin)
+            order_book_bias = None
+            if order_book_flow:
+                overall_bias = order_book_flow.get("overall_bias", "neutral")
+                confidence = order_book_flow.get("confidence", 0.0)
+                if confidence > 0.3:  # Only use if confident
+                    if overall_bias == "bid":
+                        order_book_bias = "B"
+                    elif overall_bias == "ask":
+                        order_book_bias = "A"
             
             # Weight the signals based on market regime and confidence
             signals = []
@@ -2435,6 +2844,11 @@ class MarketMaker:
             if flow_bias:
                 signals.append(flow_bias)
                 weights.append(0.8)
+            
+            # Order book flow bias (high confidence signals)
+            if order_book_bias:
+                signals.append(order_book_bias)
+                weights.append(1.2)  # Higher weight for order book flow
             
             # Default to momentum if no other signals
             if not signals and momentum_signal:
