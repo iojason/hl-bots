@@ -1559,6 +1559,60 @@ class MarketMaker:
             # If gating logic fails, fall back to normal behavior
             pass
 
+        # Quantize price and size to exchange steps
+        tick = self._effective_tick(coin, best_bid, best_ask) if adaptive_tick is None else adaptive_tick
+        step = float(self.client.sz_step(coin))
+        
+        # Quantize price to tick size
+        if side == "B":  # Bid - quantize down
+            px_q = quantize_down(d(price), d(tick))
+        else:  # Ask - quantize up
+            px_q = quantize_up(d(price), d(tick))
+        
+        # Quantize size to size step
+        sz_q = quantize_down(d(size), d(step))
+        
+        # Safety checks
+        if sz_q <= 0 or px_q <= 0:
+            return
+        
+        # Convert to float for API
+        px_f = as_float_8dp(px_q)
+        sz_f = as_float_8dp(sz_q)
+        
+        # Determine buy/sell
+        is_buy = (side == "B")
+        
+        try:
+            # Place the order using IOC
+            result = self.client.place_ioc(coin, is_buy, sz_f, px_f, reduce_only=False)
+            
+            # Log the order placement
+            self._log_lifecycle(coin, side, sz_f, px_f, "IOC_SENT")
+            
+            # Check for rate limiting
+            if result == "RATE_LIMITED":
+                self.log({"type": "warn", "op": "order_rate_limited", "coin": coin, "side": side})
+                return
+            
+            # Check for other errors
+            if isinstance(result, str) and "error" in result.lower():
+                self.log({"type": "error", "op": "order_error", "coin": coin, "side": side, "msg": result})
+                return
+            
+            # Log successful placement
+            self._tlog({
+                "type": "order_placed",
+                "coin": coin,
+                "side": side,
+                "price": px_f,
+                "size": sz_f,
+                "result": result
+            })
+            
+        except Exception as e:
+            self.log({"type": "error", "op": "order_exception", "coin": coin, "side": side, "msg": str(e)})
+
     def _place_orders_for_coin_realtime(self, coin: str, best_bid: float, best_ask: float):
         """Real-time order placement for a single coin - called immediately when market data arrives."""
         try:
