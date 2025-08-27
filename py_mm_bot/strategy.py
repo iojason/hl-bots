@@ -3432,6 +3432,11 @@ class MarketMaker:
         Returns True if position was closed, False otherwise.
         """
         try:
+            # Check if take profit is disabled for this coin
+            disabled_coins = self.cfg.get("take_profit_disabled_coins", [])
+            if coin in disabled_coins:
+                return False
+                
             st = self.coin_state(coin)
             if abs(st.pos) <= 0:
                 return False
@@ -3504,7 +3509,17 @@ class MarketMaker:
                 })
                 
                 # Use enhanced take profit with gradual price reduction
-                return self._enhanced_take_profit(coin, st.pos, mid, bb, ba)
+                try:
+                    return self._enhanced_take_profit(coin, st.pos, mid, bb, ba)
+                except Exception as e:
+                    # Catch any exceptions to prevent segmentation faults
+                    self.log({
+                        "type": "error",
+                        "op": "take_profit_exception",
+                        "coin": coin,
+                        "msg": f"Exception in take profit: {str(e)}"
+                    })
+                    return False
                 
         except Exception as e:
             self.log({"type": "warn", "op": "take_profit", "coin": coin, "msg": str(e)})
@@ -3542,22 +3557,34 @@ class MarketMaker:
             "side": side
         })
 
-        # Strategy 1: Try IOC market order (IOC with no price = market order)
+        # Strategy 1: Try with oracle price first (safest approach)
         try:
             self.log({
                 "type": "info",
-                "op": "take_profit_ioc_market",
+                "op": "take_profit_oracle",
                 "coin": coin,
-                "msg": "Attempting IOC market order"
+                "msg": "Attempting order with oracle price"
             })
             
-            # Use a realistic market price for IOC order
-            # For selling (long position), use best bid; for buying (short position), use best ask
-            market_price = best_bid if not is_buy else best_ask
-            res = self.client.place_ioc(coin, is_buy, sz_f, market_price, reduce_only=True)
+            # Get oracle price from market data
+            oracle_price = None
+            try:
+                # Try to get oracle price from user state
+                u = self.client.info.user_state(self.client.addr)
+                for ap in u.get("assetPositions", []):
+                    pos = ap.get("position", {})
+                    if pos.get("coin") == coin:
+                        oracle_price = float(pos.get("oraclePx", 0.0) or 0.0)
+                        break
+            except Exception:
+                pass
             
-            # Direct print for order response
-            print(f"📋 Take profit order response for {coin}: {res}")
+            # If we can't get oracle price, use mid price
+            if not oracle_price or oracle_price <= 0:
+                oracle_price = 0.5 * (best_bid + best_ask)
+            
+            print(f"🎯 Using oracle price for {coin}: ${oracle_price}")
+            res = self.client.place_ioc(coin, is_buy, sz_f, oracle_price, reduce_only=True)
             
             # Check for actual order success - look for errors in the nested response
             is_success = True
@@ -3577,14 +3604,14 @@ class MarketMaker:
                         break
             
             if is_success:
-                self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_IOC_MARKET_SENT")
-                print(f"✅ SUCCESS: Closed {coin} position with IOC market order")
+                self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_ORACLE_SENT")
+                print(f"✅ SUCCESS: Closed {coin} position with oracle price order")
                 return True
             else:
-                print(f"❌ FAILED: IOC market order for {coin} - {error_msg}")
+                print(f"❌ FAILED: Oracle price order for {coin} - {error_msg}")
                 self.log({
                     "type": "warn",
-                    "op": "take_profit_ioc_market",
+                    "op": "take_profit_oracle",
                     "coin": coin,
                     "error": error_msg,
                     "response": res
@@ -3593,7 +3620,7 @@ class MarketMaker:
         except Exception as e:
             self.log({
                 "type": "warn",
-                "op": "take_profit_ioc_market",
+                "op": "take_profit_oracle",
                 "coin": coin,
                 "error": str(e)
             })

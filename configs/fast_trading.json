@@ -124,7 +124,8 @@
   "flow_imbalance_update_interval_s": 10,   
   "take_profit_min_bps": 30.0,
   "take_profit_min_usd": 50.0,
-  "enhanced_take_profit_enabled": true,  
+  "enhanced_take_profit_enabled": true,
+  "take_profit_disabled_coins": ["HYPE"],  
   "per_coin": {
     "BTC": {
       "bias_side": "auto",
@@ -174,7 +175,7 @@
       "flatten_max_spread_bps": 3000,
       "take_profit_min_bps": 5.0,
       "take_profit_min_usd": 50.0,
-      "enhanced_take_profit_enabled": true,
+      "enhanced_take_profit_enabled": false,
       "flow_analysis_enabled": false,
       "order_book_flow_weight": 0.8,
       "flow_imbalance_weight": 0.4
