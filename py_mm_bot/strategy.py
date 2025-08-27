@@ -1926,18 +1926,23 @@ class MarketMaker:
             if not coin or coin not in self.cfg.get("coins", []):
                 return
             
+            # Skip problematic coins that cause segmentation faults
+            problematic_coins = []  # Add more if needed
+            if coin in problematic_coins:
+                print(f"⚠️  Skipping {coin} due to known issues")
+                return
+            
             best_bid = market_data.get("best_bid", 0.0)
             best_ask = market_data.get("best_ask", 0.0)
             
             if best_bid <= 0 or best_ask <= 0:
                 return
             
-            # Debug: Check if HYPE is being processed
-            if coin == "HYPE":
-                print(f"🎯 Processing HYPE: bid={best_bid}, ask={best_ask}")
-            
             # Place orders immediately for this coin
-            self._place_orders_for_coin_realtime(coin, best_bid, best_ask)
+            try:
+                self._place_orders_for_coin_realtime(coin, best_bid, best_ask)
+            except Exception as e:
+                self.log({"type": "error", "op": "place_orders_realtime", "coin": coin, "msg": f"Error placing orders: {e}"})
             
         except Exception as e:
             self.log({"type": "error", "op": "market_data_callback", "msg": f"Error in market data callback: {e}"})
@@ -2121,17 +2126,26 @@ class MarketMaker:
                 pass
             
             # Take profit on large profitable positions first
-            if self._maybe_take_profit(coin):
-                print(f"💰 Taking profit on {coin}, skipping new orders")
-                return  # Position was closed, skip placing new orders
+            try:
+                if self._maybe_take_profit(coin):
+                    print(f"💰 Taking profit on {coin}, skipping new orders")
+                    return  # Position was closed, skip placing new orders
+            except Exception as e:
+                self.log({"type": "error", "op": "take_profit_check", "coin": coin, "msg": f"Error in take profit check: {e}"})
             
             # Safety flatten if position too large
-            self.flatten_if_needed(coin, mid)
+            try:
+                self.flatten_if_needed(coin, mid)
+            except Exception as e:
+                self.log({"type": "error", "op": "flatten_check", "coin": coin, "msg": f"Error in flatten check: {e}"})
             
             # Enhanced bailout check for underwater positions
-            if self._enhanced_bailout_check(coin):
-                print(f"🚨 Bailing out {coin}, skipping new orders")
-                return  # Position was bailed out, skip placing new orders
+            try:
+                if self._enhanced_bailout_check(coin):
+                    print(f"🚨 Bailing out {coin}, skipping new orders")
+                    return  # Position was bailed out, skip placing new orders
+            except Exception as e:
+                self.log({"type": "error", "op": "bailout_check", "coin": coin, "msg": f"Error in bailout check: {e}"})
             
             # Join or improve inside the spread with a 1-tick cushion when possible.
             if spread >= 2.0 * tick:
@@ -2172,28 +2186,31 @@ class MarketMaker:
             allowed_side = self._get_single_side(coin)
             
             # Place orders based on single-sided mode with optimal pricing
-            if allowed_side == "B" and notional < max_coin_cap and gross < max_gross_cap:
-                # Use market-aware logic for optimal bid price
-                optimal_bid_px = self._get_optimal_single_side_price(coin, "B", bid_px, tick, best_bid, best_ask)
-                self._place_single_order_realtime(coin, "B", optimal_bid_px, size_units, best_bid, best_ask)
-                
-            elif allowed_side == "A" and notional < max_coin_cap and gross < max_gross_cap:
-                # Use market-aware logic for optimal ask price
-                optimal_ask_px = self._get_optimal_single_side_price(coin, "A", ask_px, tick, best_bid, best_ask)
-                self._place_single_order_realtime(coin, "A", optimal_ask_px, size_units, best_bid, best_ask)
-                
-            elif allowed_side == "N":
-                # No quote state - don't place any orders
-                pass
-                
-            elif allowed_side is None:
-                # Single-sided mode is off - place both sides
-                if notional < max_coin_cap and gross < max_gross_cap:
-                    print(f"📈 Placing orders for {coin}: bid={bid_px:.4f}, ask={ask_px:.4f}, size={size_units}")
-                    self._place_single_order_realtime(coin, "B", bid_px, size_units, best_bid, best_ask)
-                    self._place_single_order_realtime(coin, "A", ask_px, size_units, best_bid, best_ask)
-                else:
-                    print(f"❌ Caps exceeded for {coin}: notional={notional:.1f}/{max_coin_cap}, gross={gross:.1f}/{max_gross_cap}")
+            try:
+                if allowed_side == "B" and notional < max_coin_cap and gross < max_gross_cap:
+                    # Use market-aware logic for optimal bid price
+                    optimal_bid_px = self._get_optimal_single_side_price(coin, "B", bid_px, tick, best_bid, best_ask)
+                    self._place_single_order_realtime(coin, "B", optimal_bid_px, size_units, best_bid, best_ask)
+                    
+                elif allowed_side == "A" and notional < max_coin_cap and gross < max_gross_cap:
+                    # Use market-aware logic for optimal ask price
+                    optimal_ask_px = self._get_optimal_single_side_price(coin, "A", ask_px, tick, best_bid, best_ask)
+                    self._place_single_order_realtime(coin, "A", optimal_ask_px, size_units, best_bid, best_ask)
+                    
+                elif allowed_side == "N":
+                    # No quote state - don't place any orders
+                    pass
+                    
+                elif allowed_side is None:
+                    # Single-sided mode is off - place both sides
+                    if notional < max_coin_cap and gross < max_gross_cap:
+                        print(f"📈 Placing orders for {coin}: bid={bid_px:.4f}, ask={ask_px:.4f}, size={size_units}")
+                        self._place_single_order_realtime(coin, "B", bid_px, size_units, best_bid, best_ask)
+                        self._place_single_order_realtime(coin, "A", ask_px, size_units, best_bid, best_ask)
+            except Exception as e:
+                self.log({"type": "error", "op": "order_placement", "coin": coin, "msg": f"Error placing orders: {e}"})
+            else:
+                print(f"❌ Caps exceeded for {coin}: notional={notional:.1f}/{max_coin_cap}, gross={gross:.1f}/{max_gross_cap}")
                     
         except Exception as e:
             self.log({"type": "error", "op": "realtime_order_placement", "coin": coin, "msg": str(e)})

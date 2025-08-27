@@ -7,7 +7,6 @@
   "coins": [
     "BTC",
     "DOGE",
-    "HYPE",
     "SOL",
     "kSHIB"
   ],
@@ -125,7 +124,7 @@
   "take_profit_min_bps": 30.0,
   "take_profit_min_usd": 50.0,
   "enhanced_take_profit_enabled": true,
-  "take_profit_disabled_coins": ["HYPE"],  
+  "take_profit_disabled_coins": [],  
   "per_coin": {
     "BTC": {
       "bias_side": "auto",
@@ -163,23 +162,7 @@
       "order_book_flow_weight": 1.0,
       "flow_imbalance_weight": 0.6
     },
-    "HYPE": {
-      "bias_side": "auto",
-      "config_version": "1.1.0",
-      "size_notional_usd": 100,
-      "max_per_coin_notional": 2000,
-      "max_gross_notional": 2000,
-      "min_spread_bps": 3.5,
-      "min_replace_ms": 25,
-      "inventory_skew_ticks": 1,
-      "flatten_max_spread_bps": 3000,
-      "take_profit_min_bps": 5.0,
-      "take_profit_min_usd": 50.0,
-      "enhanced_take_profit_enabled": false,
-      "flow_analysis_enabled": false,
-      "order_book_flow_weight": 0.8,
-      "flow_imbalance_weight": 0.4
-    },
+
     "SOL": {
       "bias_side": "auto",
       "target_inventory_usd": 240,
