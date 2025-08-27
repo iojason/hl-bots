@@ -137,27 +137,39 @@ class WebSocketMarketData:
             while self.running and not self.stop_event.is_set():
                 try:
                     if self.websocket and self.ws_ready:
-                        # Use WebSocket ping frame instead of custom ping message
-                        pong_waiter = await self.websocket.ping()
-                        await asyncio.wait_for(pong_waiter, timeout=10.0)  # Wait for pong with timeout
+                        # Use Hyperliquid ping/pong messages as per API spec
+                        await self._send({"method": "ping"})
                         # Debug: Log heartbeat success occasionally
                         if time.time() % 120 < 1:  # Log once per 2 minutes
-                            print(f"💓 Heartbeat successful: ws_ready={self.ws_ready}, market_data_count={len(self.market_data)}")
+                            print(f"💓 Heartbeat sent: ws_ready={self.ws_ready}, market_data_count={len(self.market_data)}")
                     else:
                         # Wait longer when not connected
                         await asyncio.sleep(5)
                         continue
-                except asyncio.TimeoutError:
-                    print(f"Heartbeat timeout: pong not received within 10 seconds")
+                except Exception as e:
+                    print(f"Heartbeat failed: {e}")
                     print(f"   🔄 Heartbeat status: ws_ready={self.ws_ready}, running={self.running}, websocket={self.websocket is not None}")
-                    # Force reconnection on timeout
+                    # Force reconnection on heartbeat failure
                     self.ws_ready = False
+                    if self.websocket:
+                        try:
+                            await self.websocket.close()
+                        except:
+                            pass
+                        self.websocket = None
                     await asyncio.sleep(5)
                     continue
                 except Exception as e:
                     print(f"Heartbeat failed: {e}")
                     print(f"   🔄 Heartbeat status: ws_ready={self.ws_ready}, running={self.running}, websocket={self.websocket is not None}")
-                    # Don't break on heartbeat failure, just continue
+                    # Force reconnection on heartbeat failure
+                    self.ws_ready = False
+                    if self.websocket:
+                        try:
+                            await self.websocket.close()
+                        except:
+                            pass
+                        self.websocket = None
                     await asyncio.sleep(5)
                     continue
                 await asyncio.sleep(30)  # Send heartbeat every 30 seconds (keep connection alive)

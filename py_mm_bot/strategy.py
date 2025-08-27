@@ -2066,7 +2066,7 @@ class MarketMaker:
         try:
             # Skip if market data is invalid
             if best_bid <= 0 or best_ask <= 0:
-                print(f"❌ Invalid market data for {coin}: bid={best_bid}, ask={best_ask}")
+                # Invalid market data - skipping order placement
                 return
             
             spread = best_ask - best_bid
@@ -2085,7 +2085,7 @@ class MarketMaker:
             if dyn is not None:
                 eff_min_spread_bps = max(eff_min_spread_bps, float(dyn))
             if eff_min_spread_bps > 0.0 and spread_bps_live < eff_min_spread_bps:
-                print(f"❌ Spread too tight for {coin}: {spread_bps_live:.1f}bps < {eff_min_spread_bps}bps")
+                # Spread too tight - skipping order placement
                 return  # skip this coin this update
             
             # desired size (USD -> units), then round UP to size step
@@ -2096,7 +2096,7 @@ class MarketMaker:
             # margin cap
             size_units = self._cap_size_by_margin(coin, mid, size_units)
             if size_units <= 0 or size_units < step:
-                print(f"❌ Size too small for {coin}: {size_units} <= {step}")
+                # Size too small - skipping order placement
                 return
             
             # enforce exchange minimum notional (e.g., $10)
@@ -2209,8 +2209,6 @@ class MarketMaker:
                         self._place_single_order_realtime(coin, "A", ask_px, size_units, best_bid, best_ask)
             except Exception as e:
                 self.log({"type": "error", "op": "order_placement", "coin": coin, "msg": f"Error placing orders: {e}"})
-            else:
-                print(f"❌ Caps exceeded for {coin}: notional={notional:.1f}/{max_coin_cap}, gross={gross:.1f}/{max_gross_cap}")
                     
         except Exception as e:
             self.log({"type": "error", "op": "realtime_order_placement", "coin": coin, "msg": str(e)})
