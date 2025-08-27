@@ -475,14 +475,20 @@ class WebSocketMarketData:
         with self.market_data_lock:
             data = self.market_data.get(coin)
         
-        # Debug: Log what we actually have in market_data
-        if time.time() % 10 < 1:  # Log every 10 seconds
-            # print(f"🔍 get_best_bid_ask({coin}): data={data}, market_data_keys={list(self.market_data.keys())}")
-            if data:
-                age = time.time() - data.get("timestamp", 0)
-                print(f"   📊 Data age: {age:.1f}s, bid={data.get('best_bid', 0):.4f}, ask={data.get('best_ask', 0):.4f}")
-            else:
-                print(f"   ❌ No data found for {coin}")
+        # Debug: Log what we actually have in market_data (less frequent)
+        if hasattr(self, '_last_data_log') and time.time() - self._last_data_log.get(coin, 0) < 30:
+            pass  # Skip logging if we logged recently
+        elif data:
+            age = time.time() - data.get("timestamp", 0)
+            print(f"   📊 Data age: {age:.1f}s, bid={data.get('best_bid', 0):.4f}, ask={data.get('best_ask', 0):.4f}")
+            if not hasattr(self, '_last_data_log'):
+                self._last_data_log = {}
+            self._last_data_log[coin] = time.time()
+        elif not hasattr(self, '_last_data_log') or time.time() - self._last_data_log.get(coin, 0) >= 30:
+            print(f"   ❌ No data found for {coin}")
+            if not hasattr(self, '_last_data_log'):
+                self._last_data_log = {}
+            self._last_data_log[coin] = time.time()
         
         if data and (time.time() - data.get("timestamp", 0)) < 10.0:
             return data.get("best_bid", 0.0), data.get("best_ask", 0.0)
@@ -549,8 +555,14 @@ class WebSocketMarketData:
             
         if self.websocket:
             try:
-                # Close WebSocket properly - use create_task for async close
-                asyncio.create_task(self.websocket.close())
+                # Close WebSocket properly - schedule close and wait briefly
+                if hasattr(self, 'loop') and self.loop and not self.loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(self.websocket.close(), self.loop)
+                    # Give it a moment to close
+                    time.sleep(0.3)
+                else:
+                    # Fallback if no loop available
+                    self.websocket.close()
             except Exception:
                 pass
             self.websocket = None
