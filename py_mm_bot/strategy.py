@@ -2462,6 +2462,30 @@ class MarketMaker:
 
     def step(self):
         self.loop_i += 1
+        
+        # Loop protection - prevent infinite loops
+        if not hasattr(self, '_loop_start_time'):
+            self._loop_start_time = time.time()
+            self._loop_count = 0
+        
+        self._loop_count += 1
+        
+        # Check for potential infinite loops
+        current_time = time.time()
+        loop_duration = current_time - self._loop_start_time
+        
+        # If we've been running for more than 10 minutes and have > 1000 loops
+        if loop_duration > 600 and self._loop_count > 1000:
+            avg_loop_time = loop_duration / self._loop_count
+            if avg_loop_time < 0.1:  # Less than 100ms per loop
+                self.log({
+                    "type": "error",
+                    "op": "loop_protection",
+                    "msg": f"Potential infinite loop detected: {self._loop_count} loops in {loop_duration:.1f}s (avg {avg_loop_time*1000:.1f}ms/loop)"
+                })
+                # Reset counters but continue
+                self._loop_start_time = current_time
+                self._loop_count = 0
 
         # Portfolio risk check - do this first before any trading
         if self._check_portfolio_risk():

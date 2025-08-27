@@ -236,14 +236,28 @@ def upsert_performance_metrics(con, metrics_data):
     con.commit()
 
 def insert_system_event(con, event_data):
-    """Insert a system event (errors, warnings, etc.)."""
+    """Insert a system event (errors, warnings, etc.) with error recovery."""
     cols = ("timestamp", "bot_id", "event_type", "severity", "message", "details", "duration_ms", "inserted_at")
     
     event_data["inserted_at"] = datetime.datetime.utcnow().isoformat()
     
-    con.execute(f"INSERT INTO system_events({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
-                tuple(event_data.get(k) for k in cols))
-    con.commit()
+    # Add retry logic for database operations
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            con.execute(f"INSERT INTO system_events({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+                        tuple(event_data.get(k) for k in cols))
+            con.commit()
+            break  # Success, exit retry loop
+        except Exception as db_error:
+            if attempt == max_retries - 1:  # Last attempt
+                print(f"❌ Database error after {max_retries} attempts: {db_error}")
+                # Log to console as fallback
+                print(f"📊 FALLBACK LOG: {event_data}")
+            else:
+                print(f"⚠️ Database error (attempt {attempt + 1}/{max_retries}): {db_error}")
+                import time
+                time.sleep(0.1)  # Brief pause before retry
 
 def insert_rate_limit_usage(con, usage_data):
     """Insert rate limit usage snapshot."""
