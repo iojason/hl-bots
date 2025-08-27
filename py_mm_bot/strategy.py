@@ -678,13 +678,91 @@ class MarketMaker:
                     if best_bid > 0 and best_ask > 0:
                         print(f"📊 {coin} market: bid=${best_bid}, ask=${best_ask}")
                         
-                        # Try a tiny test order
+                        # Try a tiny test order with proper price quantization
                         test_size = 0.001  # Very small size
-                        test_price = best_bid * 0.99  # Just below best bid
                         
-                        print(f"🧪 Testing order: {coin} BUY {test_size} @ ${test_price}")
-                        test_res = self.client.place_ioc(coin, True, test_size, test_price, reduce_only=False)
+                        # Get proper tick size and quantize the price
+                        tick = self.client.px_step(coin)
+                        raw_test_price = best_bid * 0.99  # Just below best bid
+                        
+                        # Debug tick size detection
+                        print(f"🔍 Tick size for {coin}: {tick}")
+                        
+                        # Hyperliquid price validation rules:
+                        # - Max 5 significant figures for perps
+                        # - Max 6 decimal places for perps
+                        # - Integer prices always allowed
+                        
+                        def validate_and_quantize_price(price, coin):
+                            """Validate and quantize price according to Hyperliquid rules"""
+                            # Get szDecimals for this coin
+                            sz_decimals = 3  # Default, should get from meta
+                            try:
+                                meta = self.client._name_to_meta.get(coin, {})
+                                sz_decimals = int(meta.get("szDecimals", 3))
+                            except:
+                                pass
+                            
+                            # Max decimal places = 6 - szDecimals (for perps)
+                            max_decimals = 6 - sz_decimals
+                            
+                            # Convert to string to count significant figures
+                            price_str = f"{price:.8f}".rstrip('0').rstrip('.')
+                            
+                            # Count significant figures (non-zero digits)
+                            sig_figures = len([c for c in price_str if c.isdigit() and c != '0'])
+                            if price_str.startswith('0'):
+                                sig_figures -= 1  # Leading zeros don't count
+                            
+                            print(f"🔍 Price validation: {price_str}, sig_figures={sig_figures}, max_decimals={max_decimals}")
+                            
+                            # If too many significant figures, round to 5
+                            if sig_figures > 5:
+                                # Round to 5 significant figures
+                                from decimal import Decimal as d
+                                rounded_price = float(d(str(price)).quantize(d('0.1')))
+                                print(f"🔍 Rounded to 5 sig figs: {rounded_price}")
+                                return rounded_price
+                            
+                            return price
+                        
+                        # Validate and quantize the test price
+                        raw_test_price = best_bid * 0.99  # Just below best bid
+                        validated_price = validate_and_quantize_price(raw_test_price, coin)
+                        
+                        # Use a simple tick size based on price magnitude
+                        if validated_price >= 1000:
+                            tick = 1.0  # Large prices like BTC
+                        elif validated_price >= 1:
+                            tick = 0.01  # Medium prices like SOL
+                        else:
+                            tick = 0.00001  # Small prices like DOGE/kSHIB
+                        
+                        # Quantize down to ensure we don't cross the spread
+                        from decimal import Decimal as d
+                        # Convert tick to Decimal and quantize properly
+                        tick_decimal = d(str(tick))
+                        quantized_price = float(d(str(validated_price)).quantize(tick_decimal))
+                        
+                        print(f"🧪 Testing order: {coin} BUY {test_size} @ ${quantized_price} (tick: {tick})")
+                        
+                        # Validate the quantized price
+                        if quantized_price <= 0:
+                            print(f"❌ Invalid quantized price: {quantized_price}")
+                            continue
+                            
+                        test_res = self.client.place_ioc(coin, True, test_size, quantized_price, reduce_only=False)
                         print(f"🧪 Test order response: {test_res}")
+                        
+                        # If test failed, show price validation info
+                        if isinstance(test_res, dict) and test_res.get('status') == 'ok':
+                            response_data = test_res.get('response', {}).get('data', {})
+                            statuses = response_data.get('statuses', [])
+                            for status in statuses:
+                                if 'error' in status:
+                                    print(f"❌ Order error: {status['error']}")
+                                    print(f"   Price validation: raw={raw_test_price}, quantized={quantized_price}, tick={tick}")
+                                    print(f"   Market: bid={best_bid}, ask={best_ask}")
                         break
         except Exception as e:
             print(f"⚠️ Test order failed: {e}")
