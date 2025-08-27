@@ -11,7 +11,7 @@
     "SOL",
     "kSHIB"
   ],
-  "loop_ms": 500,
+  "loop_ms": 200,
   "flatten_on_start": false,
   "flatten_max_spread_bps": 50,
   "flatten_max_slippage_bps": 6,
@@ -100,21 +100,21 @@
   "emergency_take_profit_enabled": true,
   "emergency_take_profit_min_usd": 25.0,
   "telemetry_enabled": true,            
-  "telemetry_console": true,    
+  "telemetry_console": false,    
   "telemetry_db": false,                 
-  "fills_log_enabled": true,            
+  "fills_log_enabled": false,            
   "lifecycle_log_enabled": false,
   "fc_probe_log": false,                 
   "ss_market_aware_log_sample_s": 0,
   
   "logging": {
-    "level": "INFO",
-    "log_orders": true,
-    "log_positions": true,
-    "log_pnl": true,
-    "log_flow_analysis": true,
-    "log_rate_limits": true,
-    "log_websocket_status": true
+    "level": "WARN",
+    "log_orders": false,
+    "log_positions": false,
+    "log_pnl": false,
+    "log_flow_analysis": false,
+    "log_rate_limits": false,
+    "log_websocket_status": false
   },
   
   "flow_analysis_short_window_s": 60,
@@ -140,7 +140,7 @@
       "take_profit_min_bps": 50.0,
       "take_profit_min_usd": 200.0,
       "flatten_max_spread_bps": 20,
-      "flow_analysis_enabled": true,
+      "flow_analysis_enabled": false,
       "order_book_flow_weight": 1.2,
       "flow_imbalance_weight": 0.8
     },
@@ -158,7 +158,7 @@
       "take_profit_min_bps": 5.0,
       "take_profit_min_usd": 50.0,
       "enhanced_take_profit_enabled": true,
-      "flow_analysis_enabled": true,
+      "flow_analysis_enabled": false,
       "order_book_flow_weight": 1.0,
       "flow_imbalance_weight": 0.6
     },
@@ -175,7 +175,7 @@
       "take_profit_min_bps": 5.0,
       "take_profit_min_usd": 50.0,
       "enhanced_take_profit_enabled": true,
-      "flow_analysis_enabled": true,
+      "flow_analysis_enabled": false,
       "order_book_flow_weight": 0.8,
       "flow_imbalance_weight": 0.4
     },
@@ -193,7 +193,7 @@
       "take_profit_min_bps": 5.0,
       "take_profit_min_usd": 50.0,
       "enhanced_take_profit_enabled": true,
-      "flow_analysis_enabled": true,
+      "flow_analysis_enabled": false,
       "order_book_flow_weight": 1.1,
       "flow_imbalance_weight": 0.7
     },
@@ -209,7 +209,7 @@
       "take_profit_min_bps": 5.0,
       "take_profit_min_usd": 50.0,
       "enhanced_take_profit_enabled": true,
-      "flow_analysis_enabled": true,
+      "flow_analysis_enabled": false,
       "order_book_flow_weight": 0.9,
       "flow_imbalance_weight": 0.5
     }

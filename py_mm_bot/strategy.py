@@ -426,7 +426,7 @@ class MarketMaker:
                     config_version,
                     __import__("json").dumps(config_snapshot)
                 )
-                self._tlog({"type": "info", "coin": coin, "config_version": config_version, "msg": "Config version tracked"})
+                # self._tlog({"type": "info", "coin": coin, "config_version": config_version, "msg": "Config version tracked"})
             except Exception as e:
                 msg = str(e)
                 if "UNIQUE constraint failed" in msg:
@@ -452,13 +452,13 @@ class MarketMaker:
                 bb, ba = self.client.best_bid_ask(coin)
             except Exception:
                 bb, ba = (None, None)
-            self._tlog({
-                "type": "startup",
-                "coin": coin,
-                "px_step": step,
-                "px_decimals_override": override,
-                "bbo": [bb, ba]
-            })
+            # self._tlog({
+            #     "type": "startup",
+            #     "coin": coin,
+            #     "px_step": step,
+            #     "px_decimals_override": override,
+            #     "bbo": [bb, ba]
+            # })
 
         # Init dynamic spread buffers per coin
         for coin in self.cfg.get("coins", []):
@@ -482,7 +482,7 @@ class MarketMaker:
             cur = float(self._c(coin, "min_spread_bps", default_min))
             suggest = max(cur, be_mm + 2.0)  # +2 bps safety buffer over M→M breakeven
             # One-line, human-friendly print
-            self._tlog(f"[fee_math] {coin}: add={add_bps:.2f}bps cross={cross_bps:.2f}bps | BE M→M={be_mm:.2f}bps M→T={be_mt:.2f}bps T→T={be_tt:.2f}bps | suggest min_spread_bps≥{suggest:.2f}")
+            # self._tlog(f"[fee_math] {coin}: add={add_bps:.2f}bps cross={cross_bps:.2f}bps | BE M→M={be_mm:.2f}bps M→T={be_mt:.2f}bps T→T={be_tt:.2f}bps | suggest min_spread_bps≥{suggest:.2f}")
 
         # Guard: enforce a runtime floor for min_spread_bps so maker→maker roundtrips are net-positive
         guard_enabled = bool(self.cfg.get("min_spread_guard_enabled", True))
@@ -591,6 +591,8 @@ class MarketMaker:
             pass
 
         # Backfill position data from exchange on startup
+        print("🚀 BOT STARTUP: Checking for profitable positions to take profit immediately...")
+        print(f"🌐 Network: {'TESTNET' if self.client.mode == 'testnet' else 'MAINNET'}")
         try:
             u = self.client.info.user_state(self.client.addr)
             for ap in u.get("assetPositions", []):
@@ -610,8 +612,8 @@ class MarketMaker:
                 if abs(szi) < 1e-12:
                     continue
                 
-                # Get average entry price
-                avg_entry = float(pos.get("avgEntry", 0.0) or 0.0)
+                # Get average entry price - try both field names for compatibility
+                avg_entry = float(pos.get("entryPx", pos.get("avgEntry", 0.0)) or 0.0)
                 
                 # Backfill position state
                 st = self.coin_state(coin)
@@ -627,6 +629,38 @@ class MarketMaker:
                     "msg": f"Backfilled position: {szi} {coin} at ${avg_entry}"
                 })
                 
+                # IMMEDIATE TAKE PROFIT: Check if position is profitable and take profit immediately
+                if avg_entry > 0:  # Only if we have a valid entry price
+                    try:
+                        # Get current market price
+                        best_bid, best_ask = self.client.best_bid_ask(coin)
+                        if best_bid > 0 and best_ask > 0:
+                            mid = 0.5 * (best_bid + best_ask)
+                            
+                            # Calculate PnL
+                            if szi > 0:  # long position
+                                pnl_bps = ((mid - avg_entry) / avg_entry) * 10000.0
+                                unrealized_pnl_usd = szi * (mid - avg_entry)
+                            else:  # short position
+                                pnl_bps = ((avg_entry - mid) / avg_entry) * 10000.0
+                                unrealized_pnl_usd = abs(szi) * (avg_entry - mid)
+                            
+                            # Check take profit thresholds
+                            min_profit_bps = float(self._c(coin, "take_profit_min_bps", self.cfg.get("take_profit_min_bps", 30.0)))
+                            min_profit_usd = float(self._c(coin, "take_profit_min_usd", self.cfg.get("take_profit_min_usd", 25.0)))
+                            
+                            if pnl_bps >= min_profit_bps and unrealized_pnl_usd >= min_profit_usd:
+                                print(f"🚨 STARTUP TAKE PROFIT: {coin} position is profitable! {pnl_bps:.1f}bps, ${unrealized_pnl_usd:.0f}")
+                                print(f"   Position: {szi}, Entry: ${avg_entry}, Current: ${mid}")
+                                
+                                # Take profit immediately
+                                if self._enhanced_take_profit(coin, szi, mid, best_bid, best_ask):
+                                    print(f"✅ STARTUP SUCCESS: Closed {coin} position for profit!")
+                                else:
+                                    print(f"❌ STARTUP FAILED: Could not close {coin} position")
+                    except Exception as e:
+                        print(f"⚠️ STARTUP ERROR: Failed to check take profit for {coin}: {e}")
+                
                 # Optional: flatten on startup if user asked for it
                 if self.cfg.get("flatten_on_start"):
                     mid = self.mark_mid(coin)
@@ -634,6 +668,26 @@ class MarketMaker:
                     
         except Exception as e:
             self.log({"type": "warn", "op": "position_backfill", "msg": str(e)})
+
+        # Test order placement capability
+        print("🧪 Testing order placement capability...")
+        try:
+            for coin in self.cfg.get("coins", [])[:1]:  # Test with first coin only
+                if self.client.supports(coin):
+                    best_bid, best_ask = self.client.best_bid_ask(coin)
+                    if best_bid > 0 and best_ask > 0:
+                        print(f"📊 {coin} market: bid=${best_bid}, ask=${best_ask}")
+                        
+                        # Try a tiny test order
+                        test_size = 0.001  # Very small size
+                        test_price = best_bid * 0.99  # Just below best bid
+                        
+                        print(f"🧪 Testing order: {coin} BUY {test_size} @ ${test_price}")
+                        test_res = self.client.place_ioc(coin, True, test_size, test_price, reduce_only=False)
+                        print(f"🧪 Test order response: {test_res}")
+                        break
+        except Exception as e:
+            print(f"⚠️ Test order failed: {e}")
 
     # ---------- inventory + PnL helpers ----------
 
@@ -1878,6 +1932,10 @@ class MarketMaker:
             if best_bid <= 0 or best_ask <= 0:
                 return
             
+            # Debug: Check if HYPE is being processed
+            if coin == "HYPE":
+                print(f"🎯 Processing HYPE: bid={best_bid}, ask={best_ask}")
+            
             # Place orders immediately for this coin
             self._place_orders_for_coin_realtime(coin, best_bid, best_ask)
             
@@ -2432,6 +2490,28 @@ class MarketMaker:
 
         # Real-time order placement is now handled via WebSocket callbacks
         # This loop now only handles housekeeping and telemetry
+        
+        # HTTP-based order placement when WebSocket is disabled
+        if not self.client.use_websocket:
+            for coin in self.cfg.get("coins", []):
+                try:
+                    if not self.client.supports(coin):
+                        continue
+                    
+                    # Get current market data via HTTP
+                    best_bid, best_ask = self.client.best_bid_ask(coin)
+                    if best_bid <= 0 or best_ask <= 0:
+                        continue
+                    
+                                # Only log HYPE processing for debugging take profit
+                    if coin == "HYPE":
+                        print(f"🎯 Processing HYPE: bid={best_bid}, ask={best_ask}")
+                    
+                    # Place orders for this coin
+                    self._place_orders_for_coin_realtime(coin, best_bid, best_ask)
+                    
+                except Exception as e:
+                    self.log({"type": "error", "op": "http_order_placement", "coin": coin, "msg": str(e)})
         
         # Update spread history for dynamic min_spread calculations
         if self.cfg.get("dynamic_min_spread_enabled", True):
@@ -3405,6 +3485,11 @@ class MarketMaker:
                 total_pnl_usd >= min_profit_usd
             )
             
+            # Direct print for take profit debugging
+            if should_take_profit:
+                print(f"🎯 TAKING PROFIT ON {coin}: {pnl_bps:.1f}bps profit, ${total_pnl_usd:.0f} total profit")
+                print(f"   Position: {st.pos}, Entry: ${avg_entry}, Current: ${mid}")
+            
             if should_take_profit:
                 self.log({
                     "type": "info",
@@ -3466,23 +3551,42 @@ class MarketMaker:
                 "msg": "Attempting IOC market order"
             })
             
-            # IOC order with no price limit = market order
-            res = self.client.ex.order(coin, is_buy, sz_f, 0.0, {"limit": {"tif": "Ioc"}}, True)
+            # Use a realistic market price for IOC order
+            # For selling (long position), use best bid; for buying (short position), use best ask
+            market_price = best_bid if not is_buy else best_ask
+            res = self.client.place_ioc(coin, is_buy, sz_f, market_price, reduce_only=True)
             
-            if res.get("status") == "ok":
+            # Direct print for order response
+            print(f"📋 Take profit order response for {coin}: {res}")
+            
+            # Check for actual order success - look for errors in the nested response
+            is_success = True
+            error_msg = None
+            
+            if res.get("status") != "ok":
+                is_success = False
+                error_msg = f"Status not ok: {res.get('status')}"
+            else:
+                # Check the nested response for errors
+                response_data = res.get("response", {}).get("data", {})
+                statuses = response_data.get("statuses", [])
+                for status in statuses:
+                    if "error" in status:
+                        is_success = False
+                        error_msg = status["error"]
+                        break
+            
+            if is_success:
                 self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_IOC_MARKET_SENT")
-                self.log({
-                    "type": "success",
-                    "op": "take_profit",
-                    "coin": coin,
-                    "msg": "Successfully closed position with IOC market order"
-                })
+                print(f"✅ SUCCESS: Closed {coin} position with IOC market order")
                 return True
             else:
+                print(f"❌ FAILED: IOC market order for {coin} - {error_msg}")
                 self.log({
                     "type": "warn",
                     "op": "take_profit_ioc_market",
                     "coin": coin,
+                    "error": error_msg,
                     "response": res
                 })
                 
@@ -3503,22 +3607,38 @@ class MarketMaker:
                 "msg": "Attempting pure market order"
             })
             
-            res = self.client.ex.order(coin, is_buy, sz_f, 0.0, {"market": {}}, True)
+            # Try using place_ioc with a very aggressive price for market-like execution
+            aggressive_price = best_ask * 1.1 if is_buy else best_bid * 0.9
+            res = self.client.place_ioc(coin, is_buy, sz_f, aggressive_price, reduce_only=True)
             
-            if res.get("status") == "ok":
+            # Check for actual order success - look for errors in the nested response
+            is_success = True
+            error_msg = None
+            
+            if res.get("status") != "ok":
+                is_success = False
+                error_msg = f"Status not ok: {res.get('status')}"
+            else:
+                # Check the nested response for errors
+                response_data = res.get("response", {}).get("data", {})
+                statuses = response_data.get("statuses", [])
+                for status in statuses:
+                    if "error" in status:
+                        is_success = False
+                        error_msg = status["error"]
+                        break
+            
+            if is_success:
                 self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_PURE_MARKET_SENT")
-                self.log({
-                    "type": "success",
-                    "op": "take_profit",
-                    "coin": coin,
-                    "msg": "Successfully closed position with pure market order"
-                })
+                print(f"✅ SUCCESS: Closed {coin} position with pure market order")
                 return True
             else:
+                print(f"❌ FAILED: Pure market order for {coin} - {error_msg}")
                 self.log({
                     "type": "warn",
                     "op": "take_profit_pure_market",
                     "coin": coin,
+                    "error": error_msg,
                     "response": res
                 })
                 
@@ -3530,31 +3650,63 @@ class MarketMaker:
                 "error": str(e)
             })
 
-        # Strategy 3: Try GTC market order (GTC with no price = market order)
+        # Strategy 3: Try using oracle price (to avoid "Price too far from oracle" error)
         try:
             self.log({
                 "type": "info",
-                "op": "take_profit_gtc_market",
+                "op": "take_profit_oracle",
                 "coin": coin,
-                "msg": "Attempting GTC market order"
+                "msg": "Attempting order with oracle price"
             })
             
-            res = self.client.ex.order(coin, is_buy, sz_f, 0.0, {"limit": {"tif": "Gtc"}}, True)
+            # Get oracle price from market data
+            oracle_price = None
+            try:
+                # Try to get oracle price from user state
+                u = self.client.info.user_state(self.client.addr)
+                for ap in u.get("assetPositions", []):
+                    pos = ap.get("position", {})
+                    if pos.get("coin") == coin:
+                        oracle_price = float(pos.get("oraclePx", 0.0) or 0.0)
+                        break
+            except Exception:
+                pass
             
-            if res.get("status") == "ok":
-                self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_GTC_MARKET_SENT")
-                self.log({
-                    "type": "success",
-                    "op": "take_profit",
-                    "coin": coin,
-                    "msg": "Successfully closed position with GTC market order"
-                })
+            # If we can't get oracle price, use mid price
+            if not oracle_price or oracle_price <= 0:
+                oracle_price = 0.5 * (best_bid + best_ask)
+            
+            print(f"🎯 Using oracle price for {coin}: ${oracle_price}")
+            res = self.client.place_ioc(coin, is_buy, sz_f, oracle_price, reduce_only=True)
+            
+            # Check for actual order success - look for errors in the nested response
+            is_success = True
+            error_msg = None
+            
+            if res.get("status") != "ok":
+                is_success = False
+                error_msg = f"Status not ok: {res.get('status')}"
+            else:
+                # Check the nested response for errors
+                response_data = res.get("response", {}).get("data", {})
+                statuses = response_data.get("statuses", [])
+                for status in statuses:
+                    if "error" in status:
+                        is_success = False
+                        error_msg = status["error"]
+                        break
+            
+            if is_success:
+                self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_ORACLE_SENT")
+                print(f"✅ SUCCESS: Closed {coin} position with oracle price order")
                 return True
             else:
+                print(f"❌ FAILED: Oracle price order for {coin} - {error_msg}")
                 self.log({
                     "type": "warn",
-                    "op": "take_profit_gtc_market",
+                    "op": "take_profit_oracle",
                     "coin": coin,
+                    "error": error_msg,
                     "response": res
                 })
                 
@@ -3566,41 +3718,63 @@ class MarketMaker:
                 "error": str(e)
             })
 
-        # Strategy 4: Fallback to aggressive limit order near mid price
+        # Strategy 4: Use extremely aggressive prices to ensure immediate execution
         try:
             self.log({
                 "type": "info",
-                "op": "take_profit_aggressive_limit",
+                "op": "take_profit_market_aggressive",
                 "coin": coin,
-                "msg": "Attempting aggressive limit order near mid price"
+                "msg": "Attempting market order with extremely aggressive price for immediate execution"
             })
             
-            # Use mid price as a fallback
+            # Use extremely aggressive prices to ensure immediate execution
             tick = d(self._effective_tick(coin, best_bid, best_ask))
-            if is_buy:
-                limit_px = quantize_up(d(mid), tick)
-            else:
-                limit_px = quantize_down(d(mid), tick)
+            if is_buy:  # short position -> need to buy
+                # Use a price well above best ask to ensure immediate execution
+                aggressive_price = best_ask * 1.10  # 10% above best ask
+                limit_px = quantize_up(d(aggressive_price), tick)
+            else:  # long position -> need to sell
+                # Use a price well below best bid to ensure immediate execution
+                aggressive_price = best_bid * 0.90  # 10% below best bid
+                limit_px = quantize_down(d(aggressive_price), tick)
             
             px_f = as_float_8dp(limit_px)
+            print(f"🎯 Placing extremely aggressive order for {coin} at ${px_f} (best_bid=${best_bid}, best_ask=${best_ask})")
             
-            # Try IOC limit order
-            if self._c(coin, "flatten_reduce_only", True):
-                try:
-                    _ = self.client.place_ioc(coin, is_buy, sz_f, px_f, reduce_only=True)
-                except TypeError:
-                    _ = self.client.place_ioc(coin, is_buy, sz_f, px_f)
+            # Use IOC with extremely aggressive price to simulate market order
+            print(f"📋 Sending order: {coin} {'BUY' if is_buy else 'SELL'} {sz_f} @ ${px_f} (reduce_only=True)")
+            res = self.client.place_ioc(coin, is_buy, sz_f, px_f, reduce_only=True)
+            
+            # Check for actual order success - look for errors in the nested response
+            is_success = True
+            error_msg = None
+            
+            if res.get("status") != "ok":
+                is_success = False
+                error_msg = f"Status not ok: {res.get('status')}"
             else:
-                _ = self.client.place_ioc(coin, is_buy, sz_f, px_f)
+                # Check the nested response for errors
+                response_data = res.get("response", {}).get("data", {})
+                statuses = response_data.get("statuses", [])
+                for status in statuses:
+                    if "error" in status:
+                        is_success = False
+                        error_msg = status["error"]
+                        break
             
-            self._log_lifecycle(coin, side, sz_f, px_f, "TAKE_PROFIT_AGGRESSIVE_LIMIT_SENT")
-            self.log({
-                "type": "success",
-                "op": "take_profit",
-                "coin": coin,
-                "msg": f"Successfully closed position with aggressive limit order at {px_f}"
-            })
-            return True
+            if is_success:
+                self._log_lifecycle(coin, side, sz_f, px_f, "TAKE_PROFIT_MARKET_AGGRESSIVE_SENT")
+                print(f"✅ SUCCESS: Closed {coin} position with extremely aggressive market order at {px_f}")
+                return True
+            else:
+                print(f"❌ FAILED: Extremely aggressive market order for {coin} - {error_msg}")
+                self.log({
+                    "type": "warn",
+                    "op": "take_profit_market_aggressive",
+                    "coin": coin,
+                    "error": error_msg,
+                    "response": res
+                })
             
         except Exception as e:
             self.log({
