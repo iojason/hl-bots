@@ -79,10 +79,10 @@
   "ioc_throttle_s": 0.5,                 
   "open_orders_refresh_s": 5.0,          
   "bailout_partial_mae_bps": 30,         
-  "bailout_partial_min_seconds": 90,     
-  "bailout_partial_reduce_fraction": 0.33, 
-  "bailout_full_mae_bps": 60,            
-  "bailout_full_max_seconds": 180,       
+  "bailout_partial_min_seconds": 1200,     
+  "bailout_partial_reduce_fraction": 0.50, 
+  "bailout_full_mae_bps": 100,           
+  "bailout_full_max_seconds": 3600,      
   "bailout_full_slippage_bps": 6,        
   "bailout_pause_seconds": 30,
   "emergency_stop_loss_pct": -0.15,
@@ -124,7 +124,34 @@
   "take_profit_min_bps": 30.0,
   "take_profit_min_usd": 50.0,
   "enhanced_take_profit_enabled": true,
-  "take_profit_disabled_coins": ["HYPE"],  
+  "take_profit_disabled_coins": ["HYPE"],
+  
+  "take_profit_tiers": [
+    {"profit_bps": 20, "reduce_fraction": 0.25, "description": "Quick scalp", "priority": 1},
+    {"profit_bps": 50, "reduce_fraction": 0.50, "description": "Partial profit", "priority": 2},
+    {"profit_bps": 100, "reduce_fraction": 0.75, "description": "Major profit", "priority": 3},
+    {"profit_bps": 200, "reduce_fraction": 1.00, "description": "Full exit", "priority": 4}
+  ],
+  
+  "take_profit_market_aware": true,
+  "take_profit_momentum_threshold": 0.7,
+  "take_profit_volatility_threshold": 1.5,
+  "take_profit_momentum_lookback_seconds": 60,
+  
+  "take_profit_dynamic_enabled": true,
+  "take_profit_base_bps": 30,
+  "take_profit_momentum_multiplier": 1.5,
+  "take_profit_volatility_multiplier": 0.8,
+  "take_profit_trend_multiplier": 1.3,
+  
+  "take_profit_time_scaling": true,
+  "take_profit_min_hold_seconds": 30,
+  "take_profit_max_hold_seconds": 300,
+  "take_profit_time_multiplier": 1.2,
+  
+  "take_profit_flow_aware": true,
+  "take_profit_flow_threshold": 0.6,
+  "take_profit_flow_multiplier": 1.4,  
   "per_coin": {
     "BTC": {
       "bias_side": "auto",

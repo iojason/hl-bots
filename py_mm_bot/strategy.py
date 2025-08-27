@@ -3443,8 +3443,8 @@ class MarketMaker:
 
     def _maybe_take_profit(self, coin: str) -> bool:
         """
-        Enhanced take profit with gradual price reduction and market order fallback.
-        Returns True if position was closed, False otherwise.
+        Enhanced take profit with tiered profit-taking, market awareness, and dynamic thresholds.
+        Returns True if position was partially or fully closed, False otherwise.
         """
         try:
             # Check if take profit is disabled for this coin
@@ -3462,24 +3462,24 @@ class MarketMaker:
                 
             mid = 0.5 * (bb + ba)
             
+            # Update position start time for time-based adjustments
+            self._update_position_start_time(coin)
+            
             # Calculate unrealized PnL in bps and USD
             avg_entry = float(st.avg_entry or 0.0)
             if avg_entry <= 0:
                 return False
                 
             if st.pos > 0:  # long position
-                # Profitable when mid > avg_entry
                 pnl_bps = ((mid - avg_entry) / avg_entry) * 10000.0
-                unrealized_pnl_usd = st.pos * (mid - avg_entry)  # Unrealized profit in USD terms
+                unrealized_pnl_usd = st.pos * (mid - avg_entry)
             else:  # short position
-                # Profitable when mid < avg_entry  
                 pnl_bps = ((avg_entry - mid) / avg_entry) * 10000.0
-                unrealized_pnl_usd = abs(st.pos) * (avg_entry - mid)  # Unrealized profit in USD terms
+                unrealized_pnl_usd = abs(st.pos) * (avg_entry - mid)
             
-            # Get current funding (if available)
+            # Get current funding
             funding_usd = 0.0
             try:
-                # Try to get funding from user state
                 u = self.client.info.user_state(self.client.addr)
                 for ap in u.get("assetPositions", []):
                     pos = ap.get("position", {})
@@ -3487,57 +3487,37 @@ class MarketMaker:
                         funding_usd = float(pos.get("funding", 0.0) or 0.0)
                         break
             except Exception:
-                # If we can't get funding, assume 0
                 funding_usd = 0.0
             
-            # Total profit = unrealized + funding
             total_pnl_usd = unrealized_pnl_usd + funding_usd
             
-            # Take profit thresholds (configurable)
-            min_profit_bps = float(self._c(coin, "take_profit_min_bps", self.cfg.get("take_profit_min_bps", 30.0)))  # 30 bps = 0.3%
-            min_profit_usd = float(self._c(coin, "take_profit_min_usd", self.cfg.get("take_profit_min_usd", 25.0)))  # $25 minimum profit
+            # Get market awareness data
+            market_conditions = self._analyze_take_profit_market_conditions(coin, mid)
             
-            # Take profit conditions:
-            # 1. Position is profitable above percentage threshold (bps)
-            # 2. Total profit in USD (unrealized + funding) is above minimum threshold
-            should_take_profit = (
-                pnl_bps >= min_profit_bps and 
-                total_pnl_usd >= min_profit_usd
-            )
+            # Calculate dynamic thresholds
+            dynamic_thresholds = self._calculate_dynamic_take_profit_thresholds(coin, pnl_bps, market_conditions)
             
-            # Direct print for take profit debugging
-            if should_take_profit:
-                print(f"🎯 TAKING PROFIT ON {coin}: {pnl_bps:.1f}bps profit, ${total_pnl_usd:.0f} total profit")
-                print(f"   Position: {st.pos}, Entry: ${avg_entry}, Current: ${mid}")
+            # Check tiered take profit conditions
+            tier_result = self._check_tiered_take_profit(coin, pnl_bps, total_pnl_usd, dynamic_thresholds, market_conditions)
             
-            if should_take_profit:
+            if tier_result["should_take_profit"]:
                 self.log({
                     "type": "info",
-                    "op": "take_profit",
+                    "op": "enhanced_take_profit",
                     "coin": coin,
-                    "msg": f"Taking profit: {pnl_bps:.1f}bps profit, ${total_pnl_usd:.0f} total profit (${unrealized_pnl_usd:.0f} unrealized + ${funding_usd:.0f} funding)",
+                    "msg": f"Tiered take profit triggered: {tier_result['tier_name']} - {pnl_bps:.1f}bps profit, ${total_pnl_usd:.0f} total profit",
                     "pnl_bps": round(pnl_bps, 1),
-                    "unrealized_pnl_usd": round(unrealized_pnl_usd, 0),
-                    "funding_usd": round(funding_usd, 0),
                     "total_pnl_usd": round(total_pnl_usd, 0),
-                    "position_size": st.pos
+                    "reduce_fraction": tier_result["reduce_fraction"],
+                    "market_conditions": market_conditions,
+                    "dynamic_thresholds": dynamic_thresholds
                 })
                 
-                # Use enhanced take profit with gradual price reduction
-                try:
-                    return self._enhanced_take_profit(coin, st.pos, mid, bb, ba)
-                except Exception as e:
-                    # Catch any exceptions to prevent segmentation faults
-                    self.log({
-                        "type": "error",
-                        "op": "take_profit_exception",
-                        "coin": coin,
-                        "msg": f"Exception in take profit: {str(e)}"
-                    })
-                    return False
+                # Execute the take profit
+                return self._execute_tiered_take_profit(coin, st.pos, mid, bb, ba, tier_result)
                 
         except Exception as e:
-            self.log({"type": "warn", "op": "take_profit", "coin": coin, "msg": str(e)})
+            self.log({"type": "warn", "op": "enhanced_take_profit", "coin": coin, "msg": str(e)})
         
         return False
 
@@ -3572,34 +3552,28 @@ class MarketMaker:
             "side": side
         })
 
-        # Strategy 1: Try with oracle price first (safest approach)
+        # Strategy 1: Try with mark price first (recommended for trading decisions)
         try:
             self.log({
                 "type": "info",
-                "op": "take_profit_oracle",
+                "op": "take_profit_mark",
                 "coin": coin,
-                "msg": "Attempting order with oracle price"
+                "msg": "Attempting order with mark price"
             })
             
-            # Get oracle price from market data
-            oracle_price = None
-            try:
-                # Try to get oracle price from user state
-                u = self.client.info.user_state(self.client.addr)
-                for ap in u.get("assetPositions", []):
-                    pos = ap.get("position", {})
-                    if pos.get("coin") == coin:
-                        oracle_price = float(pos.get("oraclePx", 0.0) or 0.0)
-                        break
-            except Exception:
-                pass
+            # Get mark price from market data
+            mark_price = self._get_mark_price(coin)
             
-            # If we can't get oracle price, use mid price
-            if not oracle_price or oracle_price <= 0:
-                oracle_price = 0.5 * (best_bid + best_ask)
+            # If we can't get mark price, try oracle price as fallback
+            if not mark_price or mark_price <= 0:
+                mark_price = self._get_oracle_price(coin)
             
-            print(f"🎯 Using oracle price for {coin}: ${oracle_price}")
-            res = self.client.place_ioc(coin, is_buy, sz_f, oracle_price, reduce_only=True)
+            # If we still can't get a price, use mid price
+            if not mark_price or mark_price <= 0:
+                mark_price = 0.5 * (best_bid + best_ask)
+            
+            print(f"🎯 Using mark price for {coin}: ${mark_price}")
+            res = self.client.place_ioc(coin, is_buy, sz_f, mark_price, reduce_only=True)
             
             # Check for actual order success - look for errors in the nested response
             is_success = True
@@ -3619,14 +3593,14 @@ class MarketMaker:
                         break
             
             if is_success:
-                self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_ORACLE_SENT")
-                print(f"✅ SUCCESS: Closed {coin} position with oracle price order")
+                self._log_lifecycle(coin, side, sz_f, 0.0, "TAKE_PROFIT_MARK_SENT")
+                print(f"✅ SUCCESS: Closed {coin} position with mark price order")
                 return True
             else:
-                print(f"❌ FAILED: Oracle price order for {coin} - {error_msg}")
+                print(f"❌ FAILED: Mark price order for {coin} - {error_msg}")
                 self.log({
                     "type": "warn",
-                    "op": "take_profit_oracle",
+                    "op": "take_profit_mark",
                     "coin": coin,
                     "error": error_msg,
                     "response": res
@@ -3635,7 +3609,7 @@ class MarketMaker:
         except Exception as e:
             self.log({
                 "type": "warn",
-                "op": "take_profit_oracle",
+                "op": "take_profit_mark",
                 "coin": coin,
                 "error": str(e)
             })
@@ -3845,3 +3819,428 @@ class MarketMaker:
             self._flatten_position_immediate(coin, state.pos, mid)
         except Exception as e:
             self.log({"type": "warn", "op": "flatten_if_needed", "coin": coin, "msg": str(e)})
+
+    # ---------- Enhanced Take Profit Helper Functions ----------
+
+    def _analyze_take_profit_market_conditions(self, coin: str, mid: float) -> dict:
+        """
+        Analyze market conditions for take profit decisions.
+        Returns dict with momentum, volatility, trend, and flow signals.
+        """
+        try:
+            # Get price history for analysis
+            price_history = getattr(self, f"_price_history_{coin}", [])
+            if len(price_history) < 10:
+                return {
+                    "momentum": 0.0,
+                    "volatility": 0.0,
+                    "trend_strength": 0.0,
+                    "flow_imbalance": 0.0,
+                    "market_regime": "unknown"
+                }
+            
+            # Calculate momentum (recent price change)
+            recent_prices = price_history[-10:]  # Last 10 price points
+            if len(recent_prices) >= 2:
+                start_price = float(recent_prices[0])
+                end_price = float(recent_prices[-1])
+                momentum = ((end_price - start_price) / start_price) * 10000  # in bps
+            else:
+                momentum = 0.0
+            
+            # Calculate volatility (standard deviation of returns)
+            returns = []
+            for i in range(1, len(recent_prices)):
+                if float(recent_prices[i-1]) > 0:
+                    ret = (float(recent_prices[i]) - float(recent_prices[i-1])) / float(recent_prices[i-1])
+                    returns.append(ret)
+            
+            volatility = 0.0
+            if returns:
+                import statistics
+                volatility = statistics.stdev(returns) * 10000  # in bps
+            
+            # Calculate trend strength (consistency of direction)
+            positive_moves = sum(1 for i in range(1, len(recent_prices)) 
+                               if float(recent_prices[i]) > float(recent_prices[i-1]))
+            trend_strength = positive_moves / (len(recent_prices) - 1) if len(recent_prices) > 1 else 0.5
+            
+            # Get flow imbalance from maker/taker fills
+            mb, ms, mk, tk = self._ma_get(coin)
+            total_flow = mb + ms
+            flow_imbalance = 0.0
+            if total_flow > 0:
+                flow_imbalance = (mb - ms) / total_flow  # -1 to +1
+            
+            # Determine market regime
+            market_regime = "stable"
+            if volatility > 50:
+                market_regime = "volatile"
+            elif abs(momentum) > 20:
+                market_regime = "trending"
+            elif volatility > 20:
+                market_regime = "choppy"
+            
+            return {
+                "momentum": momentum,
+                "volatility": volatility,
+                "trend_strength": trend_strength,
+                "flow_imbalance": flow_imbalance,
+                "market_regime": market_regime
+            }
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "market_conditions_analysis", "coin": coin, "msg": str(e)})
+            return {
+                "momentum": 0.0,
+                "volatility": 0.0,
+                "trend_strength": 0.5,
+                "flow_imbalance": 0.0,
+                "market_regime": "unknown"
+            }
+
+    def _calculate_dynamic_take_profit_thresholds(self, coin: str, current_pnl_bps: float, market_conditions: dict) -> dict:
+        """
+        Calculate dynamic take profit thresholds based on market conditions.
+        """
+        try:
+            # Base thresholds from config
+            base_bps = float(self.cfg.get("take_profit_base_bps", 30.0))
+            momentum_mult = float(self.cfg.get("take_profit_momentum_multiplier", 1.5))
+            volatility_mult = float(self.cfg.get("take_profit_volatility_multiplier", 0.8))
+            trend_mult = float(self.cfg.get("take_profit_trend_multiplier", 1.3))
+            flow_mult = float(self.cfg.get("take_profit_flow_multiplier", 1.4))
+            
+            # Get market conditions
+            momentum = market_conditions.get("momentum", 0.0)
+            volatility = market_conditions.get("volatility", 0.0)
+            trend_strength = market_conditions.get("trend_strength", 0.5)
+            flow_imbalance = market_conditions.get("flow_imbalance", 0.0)
+            market_regime = market_conditions.get("market_regime", "unknown")
+            
+            # Calculate position direction (positive = long, negative = short)
+            st = self.coin_state(coin)
+            position_direction = 1.0 if st.pos > 0 else -1.0
+            
+            # Momentum adjustment (favorable momentum = higher thresholds)
+            momentum_adjustment = 1.0
+            if abs(momentum) > 10:  # Significant momentum
+                if (momentum > 0 and position_direction > 0) or (momentum < 0 and position_direction < 0):
+                    # Favorable momentum - increase thresholds
+                    momentum_adjustment = momentum_mult
+                else:
+                    # Unfavorable momentum - decrease thresholds
+                    momentum_adjustment = 1.0 / momentum_mult
+            
+            # Volatility adjustment (high volatility = lower thresholds for safety)
+            volatility_adjustment = 1.0
+            if volatility > 30:
+                volatility_adjustment = volatility_mult
+            
+            # Trend adjustment (strong trend = higher thresholds)
+            trend_adjustment = 1.0
+            if trend_strength > 0.7 or trend_strength < 0.3:  # Strong trend
+                if (trend_strength > 0.7 and position_direction > 0) or (trend_strength < 0.3 and position_direction < 0):
+                    # Favorable trend - increase thresholds
+                    trend_adjustment = trend_mult
+                else:
+                    # Unfavorable trend - decrease thresholds
+                    trend_adjustment = 1.0 / trend_mult
+            
+            # Flow adjustment (favorable flow = higher thresholds)
+            flow_adjustment = 1.0
+            if abs(flow_imbalance) > 0.3:  # Significant flow imbalance
+                if (flow_imbalance > 0 and position_direction > 0) or (flow_imbalance < 0 and position_direction < 0):
+                    # Favorable flow - increase thresholds
+                    flow_adjustment = flow_mult
+                else:
+                    # Unfavorable flow - decrease thresholds
+                    flow_adjustment = 1.0 / flow_mult
+            
+            # Time-based adjustment
+            time_adjustment = 1.0
+            if self.cfg.get("take_profit_time_scaling", True):
+                # Get position age
+                position_start_time = getattr(self, f"_position_start_time_{coin}", time.time())
+                position_age = time.time() - position_start_time
+                
+                min_hold = float(self.cfg.get("take_profit_min_hold_seconds", 30))
+                max_hold = float(self.cfg.get("take_profit_max_hold_seconds", 300))
+                time_mult = float(self.cfg.get("take_profit_time_multiplier", 1.2))
+                
+                if position_age < min_hold:
+                    # Too early - increase thresholds
+                    time_adjustment = time_mult
+                elif position_age > max_hold:
+                    # Held too long - decrease thresholds
+                    time_adjustment = 1.0 / time_mult
+            
+            # Combine all adjustments
+            total_adjustment = (momentum_adjustment * volatility_adjustment * 
+                              trend_adjustment * flow_adjustment * time_adjustment)
+            
+            # Calculate dynamic thresholds
+            dynamic_bps = base_bps * total_adjustment
+            
+            # Apply per-coin overrides
+            per_coin_bps = self._c(coin, "take_profit_min_bps", None)
+            if per_coin_bps is not None:
+                dynamic_bps = per_coin_bps * total_adjustment
+            
+            return {
+                "base_bps": base_bps,
+                "dynamic_bps": dynamic_bps,
+                "total_adjustment": total_adjustment,
+                "momentum_adjustment": momentum_adjustment,
+                "volatility_adjustment": volatility_adjustment,
+                "trend_adjustment": trend_adjustment,
+                "flow_adjustment": flow_adjustment,
+                "time_adjustment": time_adjustment,
+                "market_regime": market_regime
+            }
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "dynamic_thresholds", "coin": coin, "msg": str(e)})
+            return {
+                "base_bps": 30.0,
+                "dynamic_bps": 30.0,
+                "total_adjustment": 1.0,
+                "market_regime": "unknown"
+            }
+
+    def _check_tiered_take_profit(self, coin: str, pnl_bps: float, total_pnl_usd: float, 
+                                 dynamic_thresholds: dict, market_conditions: dict) -> dict:
+        """
+        Check tiered take profit conditions and return the appropriate tier.
+        """
+        try:
+            # Get tiered configuration
+            tiers = self.cfg.get("take_profit_tiers", [
+                {"profit_bps": 20, "reduce_fraction": 0.25, "description": "Quick scalp", "priority": 1},
+                {"profit_bps": 50, "reduce_fraction": 0.50, "description": "Partial profit", "priority": 2},
+                {"profit_bps": 100, "reduce_fraction": 0.75, "description": "Major profit", "priority": 3},
+                {"profit_bps": 200, "reduce_fraction": 1.00, "description": "Full exit", "priority": 4}
+            ])
+            
+            # Sort tiers by priority (highest first)
+            tiers.sort(key=lambda x: x.get("priority", 0), reverse=True)
+            
+            # Check each tier from highest to lowest
+            for tier in tiers:
+                tier_bps = float(tier.get("profit_bps", 0))
+                reduce_fraction = float(tier.get("reduce_fraction", 1.0))
+                description = tier.get("description", "Unknown")
+                
+                # Apply dynamic adjustment to tier threshold
+                adjusted_tier_bps = tier_bps * dynamic_thresholds.get("total_adjustment", 1.0)
+                
+                # Check if we meet this tier's conditions
+                min_usd = float(self._c(coin, "take_profit_min_usd", self.cfg.get("take_profit_min_usd", 50.0)))
+                
+                if pnl_bps >= adjusted_tier_bps and total_pnl_usd >= min_usd:
+                    # Check if we've already taken profit at this tier
+                    tier_key = f"_tier_taken_{coin}_{tier.get('priority', 0)}"
+                    if not getattr(self, tier_key, False):
+                        # Mark this tier as taken
+                        setattr(self, tier_key, True)
+                        
+                        return {
+                            "should_take_profit": True,
+                            "tier_name": description,
+                            "tier_bps": tier_bps,
+                            "adjusted_tier_bps": adjusted_tier_bps,
+                            "reduce_fraction": reduce_fraction,
+                            "priority": tier.get("priority", 0),
+                            "market_conditions": market_conditions,
+                            "dynamic_thresholds": dynamic_thresholds
+                        }
+            
+            # No tier conditions met
+            return {
+                "should_take_profit": False,
+                "tier_name": None,
+                "reduce_fraction": 0.0
+            }
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "tiered_take_profit_check", "coin": coin, "msg": str(e)})
+            return {
+                "should_take_profit": False,
+                "tier_name": None,
+                "reduce_fraction": 0.0
+            }
+
+    def _execute_tiered_take_profit(self, coin: str, position_size: float, mid: float, 
+                                  best_bid: float, best_ask: float, tier_result: dict) -> bool:
+        """
+        Execute the tiered take profit action.
+        """
+        try:
+            reduce_fraction = tier_result.get("reduce_fraction", 1.0)
+            tier_name = tier_result.get("tier_name", "Unknown")
+            
+            # Calculate the size to reduce
+            step = d(self.client.sz_step(coin))
+            total_size = d(abs(position_size))
+            reduce_size = total_size * d(reduce_fraction)
+            sz_f = as_float_8dp(quantize_down(reduce_size, step))
+            
+            if sz_f <= 0:
+                return False
+            
+            # Determine side (long position -> sell, short position -> buy)
+            is_buy = position_size < 0  # short position needs to buy to close
+            side = "B" if is_buy else "A"
+            
+            self.log({
+                "type": "info",
+                "op": "execute_tiered_take_profit",
+                "coin": coin,
+                "msg": f"Executing {tier_name}: reducing {reduce_fraction*100:.0f}% of position ({sz_f} units)",
+                "position_size": position_size,
+                "reduce_size": sz_f,
+                "side": side
+            })
+            
+            # Execute the take profit using the enhanced method
+            success = self._enhanced_take_profit_partial(coin, sz_f, mid, best_bid, best_ask, is_buy)
+            
+            if success:
+                print(f"✅ SUCCESS: {tier_name} executed for {coin} - reduced {reduce_fraction*100:.0f}% of position")
+                
+                # Reset tier tracking if this was a full exit
+                if reduce_fraction >= 1.0:
+                    self._reset_tier_tracking(coin)
+                
+                return True
+            else:
+                print(f"❌ FAILED: {tier_name} execution for {coin}")
+                return False
+                
+        except Exception as e:
+            self.log({"type": "error", "op": "execute_tiered_take_profit", "coin": coin, "msg": str(e)})
+            return False
+
+    def _enhanced_take_profit_partial(self, coin: str, sz_f: float, mid: float, 
+                                    best_bid: float, best_ask: float, is_buy: bool) -> bool:
+        """
+        Enhanced take profit for partial position reduction.
+        Uses mark price as primary choice (recommended by Hyperliquid docs).
+        """
+        try:
+            # Strategy 1: Try mark price first (preferred for trading decisions)
+            mark_price = self._get_mark_price(coin)
+            if mark_price and mark_price > 0:
+                res = self.client.place_ioc(coin, is_buy, sz_f, mark_price, reduce_only=True)
+                if self._check_order_success(res):
+                    self._log_lifecycle(coin, "B" if is_buy else "A", sz_f, mark_price, "TAKE_PROFIT_PARTIAL_MARK")
+                    return True
+            
+            # Strategy 2: Try oracle price (fallback)
+            oracle_price = self._get_oracle_price(coin)
+            if oracle_price and oracle_price > 0:
+                res = self.client.place_ioc(coin, is_buy, sz_f, oracle_price, reduce_only=True)
+                if self._check_order_success(res):
+                    self._log_lifecycle(coin, "B" if is_buy else "A", sz_f, oracle_price, "TAKE_PROFIT_PARTIAL_ORACLE")
+                    return True
+            
+            # Strategy 3: Try aggressive market order
+            aggressive_price = best_ask * 1.05 if is_buy else best_bid * 0.95
+            res = self.client.place_ioc(coin, is_buy, sz_f, aggressive_price, reduce_only=True)
+            if self._check_order_success(res):
+                self._log_lifecycle(coin, "B" if is_buy else "A", sz_f, aggressive_price, "TAKE_PROFIT_PARTIAL_AGGRESSIVE")
+                return True
+            
+            # Strategy 4: Try mid price
+            res = self.client.place_ioc(coin, is_buy, sz_f, mid, reduce_only=True)
+            if self._check_order_success(res):
+                self._log_lifecycle(coin, "B" if is_buy else "A", sz_f, mid, "TAKE_PROFIT_PARTIAL_MID")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.log({"type": "warn", "op": "enhanced_take_profit_partial", "coin": coin, "msg": str(e)})
+            return False
+
+    def _get_mark_price(self, coin: str) -> float:
+        """
+        Get mark price for a coin (preferred over oracle price for trading decisions).
+        Mark price is used for margining, liquidations, TP/SL, and unrealized PnL.
+        """
+        try:
+            u = self.client.info.user_state(self.client.addr)
+            for ap in u.get("assetPositions", []):
+                pos = ap.get("position", {})
+                if pos.get("coin") == coin:
+                    mark_price = float(pos.get("markPx", 0.0) or 0.0)
+                    return mark_price if mark_price > 0 else None
+        except Exception:
+            pass
+        return None
+
+    def _get_oracle_price(self, coin: str) -> float:
+        """
+        Get oracle price for a coin (fallback option).
+        Oracle price is used for funding rate calculations.
+        """
+        try:
+            u = self.client.info.user_state(self.client.addr)
+            for ap in u.get("assetPositions", []):
+                pos = ap.get("position", {})
+                if pos.get("coin") == coin:
+                    oracle_price = float(pos.get("oraclePx", 0.0) or 0.0)
+                    return oracle_price if oracle_price > 0 else None
+        except Exception:
+            pass
+        return None
+
+    def _check_order_success(self, res: dict) -> bool:
+        """
+        Check if an order was successful.
+        """
+        try:
+            if res.get("status") != "ok":
+                return False
+            
+            response_data = res.get("response", {}).get("data", {})
+            statuses = response_data.get("statuses", [])
+            for status in statuses:
+                if "error" in status:
+                    return False
+            
+            return True
+        except Exception:
+            return False
+
+    def _reset_tier_tracking(self, coin: str):
+        """
+        Reset tier tracking for a coin when position is fully closed.
+        """
+        try:
+            # Reset all tier tracking flags for this coin
+            for i in range(1, 5):  # Assuming max 4 tiers
+                tier_key = f"_tier_taken_{coin}_{i}"
+                if hasattr(self, tier_key):
+                    setattr(self, tier_key, False)
+        except Exception:
+            pass
+
+    def _update_position_start_time(self, coin: str):
+        """
+        Update position start time for time-based adjustments.
+        """
+        try:
+            st = self.coin_state(coin)
+            if abs(st.pos) > 0:
+                # Position exists - update start time if not set
+                time_key = f"_position_start_time_{coin}"
+                if not hasattr(self, time_key):
+                    setattr(self, time_key, time.time())
+            else:
+                # No position - clear start time
+                time_key = f"_position_start_time_{coin}"
+                if hasattr(self, time_key):
+                    delattr(self, time_key)
+        except Exception:
+            pass
