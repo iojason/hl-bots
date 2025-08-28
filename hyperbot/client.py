@@ -231,11 +231,17 @@ class SimpleHLClient:
             print(f"💰 Using default fees - Maker: {self.user_fees_cache['userAddRate']:.4f}, Taker: {self.user_fees_cache['userCrossRate']:.4f}")
     
     def get_user_fees(self) -> Dict:
-        """Get user's fee rates (cached for 5 minutes)."""
+        """Get user's fee rates (cached for 1 day)."""
         now = time.time()
-        if self.user_fees_cache and (now - self.user_fees_cache["timestamp"]) < 300:
+        if self.user_fees_cache and (now - self.user_fees_cache["timestamp"]) < 86400:  # 24 hours = 86400 seconds
             return self.user_fees_cache
         
         # Refresh fees if cache is stale
+        self._fetch_user_fees()
+        return self.user_fees_cache
+    
+    def force_refresh_fees(self):
+        """Force refresh of user fees (useful after staking)."""
+        print("🔄 Forcing fee refresh...")
         self._fetch_user_fees()
         return self.user_fees_cache
