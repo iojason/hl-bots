@@ -204,7 +204,6 @@ class SimpleHLClient:
             
             # If we found a valid tick size, return it
             if min_tick != float('inf') and min_tick > 0:
-                print(f"🔍 {coin}: Calculated tick size from order book: {min_tick}")
                 return min_tick
             
             return self._get_fallback_tick_size(coin)

@@ -170,9 +170,7 @@ class MarketMaker:
             
             # Check spread
             spread_bps = self.calculate_spread_bps(bid, ask)
-            print(f"🔍 {coin}: Market spread {spread_bps:.1f}bps (need {self.min_spread_bps}bps)")
             if spread_bps < self.min_spread_bps:
-                print(f"⚠️ {coin}: Spread too narrow - {spread_bps:.1f}bps < {self.min_spread_bps}bps")
                 self.no_trade_reasons[coin] = f"Spread too narrow: {spread_bps:.1f}bps < {self.min_spread_bps}bps"
                 return
             
@@ -199,36 +197,27 @@ class MarketMaker:
             tick_size = self.client.get_tick_size(coin)
             market_spread = ask - bid
             
-            print(f"🔍 {coin}: Market bid: ${bid:.6f}, ask: ${ask:.6f}, spread: ${market_spread:.6f}, tick_size: ${tick_size:.6f}")
-            
-            # Check if spread is wide enough for our tick size
-            if market_spread <= tick_size * 2:
-                print(f"⚠️ {coin}: Spread too tight for tick size - spread: ${market_spread:.6f}, need: ${tick_size * 2:.6f}")
+            # Check if spread is wide enough for at least 1 tick
+            if market_spread < tick_size:
                 return
             
-            # For very tight spreads, place orders at market prices
-            # For wider spreads, place orders one tick inside
-            if market_spread <= tick_size * 4:
-                # Very tight spread - place at market
+            # For tight spreads (1-2 ticks), place orders at market prices
+            # For wider spreads (3+ ticks), place orders one tick inside
+            if market_spread <= tick_size * 2:
+                # Tight spread - place at market
                 bid_price = self.quantize_price(bid, coin)
                 ask_price = self.quantize_price(ask, coin)
-                print(f"🔍 {coin}: Using market prices (tight spread)")
             else:
                 # Wider spread - place one tick inside
                 bid_price = self.quantize_price(bid + tick_size, coin)
                 ask_price = self.quantize_price(ask - tick_size, coin)
-                print(f"🔍 {coin}: Using one tick inside (wider spread)")
-            
-            print(f"🔍 {coin}: Order bid: ${bid_price:.6f}, ask: ${ask_price:.6f}")
             
             # Ensure our bid is still below our ask
             if bid_price >= ask_price:
-                print(f"⚠️ {coin}: Invalid order prices after quantization")
                 return
             
             # Calculate our actual spread
             our_spread = ask_price - bid_price
-            print(f"🔍 {coin}: Our spread: ${our_spread:.6f} (bid: ${bid_price:.6f}, ask: ${ask_price:.6f})")
             
             # Calculate fees for our orders
             bid_value = bid_price * order_size
@@ -238,11 +227,8 @@ class MarketMaker:
             # Calculate potential profit (our spread minus fees)
             potential_profit = (our_spread * order_size) - maker_fees
             
-            print(f"🔍 {coin}: Potential profit: ${potential_profit:.4f} (spread: ${our_spread:.6f}, fees: ${maker_fees:.4f})")
-            
             # Check if profitable
             if potential_profit <= 0:
-                print(f"⚠️ {coin}: Not profitable - profit: ${potential_profit:.4f}")
                 self.no_trade_reasons[coin] = f"Not profitable: ${potential_profit:.4f}"
                 return
             
@@ -260,11 +246,7 @@ class MarketMaker:
             potential_profit_per_order = avg_distance * order_size
             
             # Place orders
-            print(f"📈 {coin}: Placing orders - Bid: {bid_price:.4f}, Ask: {ask_price:.4f}, Size: {order_size:.4f}")
-            print(f"   💰 Market spread: {market_spread:.4f} | Our spread: {our_spread:.4f}")
-            print(f"   💰 Spread captured: {spread_captured:.4f} | Gross profit: ${realistic_profit:.4f}")
-            print(f"   💰 Maker fees: ${maker_fees:.4f} | Net profit: ${net_profit:.4f}")
-            print(f"   💰 Break-even spread: {break_even_spread:.4f} | Min spread needed: {break_even_spread:.4f}")
+            print(f"📈 {coin}: BID ${bid_price:.6f} | ASK ${ask_price:.6f} | Size {order_size:.0f} | Profit ${potential_profit:.4f}")
             
             # Check if we should skew orders based on current position
             should_bid, should_ask = self.should_skew_orders(coin)
@@ -272,27 +254,22 @@ class MarketMaker:
             # Place bid order (if we should)
             if should_bid:
                 bid_result = self.client.place_order(coin, True, order_size, bid_price)
-                if bid_result["success"]:
-                    print(f"✅ {coin}: Bid order placed successfully")
-                else:
-                    print(f"❌ {coin}: Bid order failed - {bid_result.get('error', 'Unknown error')}")
-            else:
-                print(f"⏸️ {coin}: Skipping bid order (long position)")
+                if not bid_result["success"]:
+                    print(f"❌ {coin}: Bid failed - {bid_result.get('error', 'Unknown error')}")
             
             # Place ask order (if we should)
             if should_ask:
                 ask_result = self.client.place_order(coin, False, order_size, ask_price)
-                if ask_result["success"]:
-                    print(f"✅ {coin}: Ask order placed successfully")
-                else:
-                    print(f"❌ {coin}: Ask order failed - {ask_result.get('error', 'Unknown error')}")
-            else:
-                print(f"⏸️ {coin}: Skipping ask order (short position)")
+                if not ask_result["success"]:
+                    print(f"❌ {coin}: Ask failed - {ask_result.get('error', 'Unknown error')}")
             
             # Update last order time and clear no-trade reason
             self.last_order_time[coin] = time.time()
             if coin in self.no_trade_reasons:
                 del self.no_trade_reasons[coin]
+            
+            # Show current open orders (silent)
+            open_orders = self.client.get_open_orders(coin)
             
         except Exception as e:
             print(f"❌ Error placing orders for {coin}: {e}")
@@ -428,10 +405,9 @@ class MarketMaker:
             total_pnl = 0.0
             active_positions = 0
             
-            print("\n📊 Position Summary:")
+            print("\n📊 Positions & Orders:")
             for coin, pos in positions.items():
                 if pos["size"] != 0:
-                    active_positions += 1
                     total_pnl += pos["unrealized_pnl"]
                     side = "LONG" if pos["size"] > 0 else "SHORT"
                     pnl_pct = self.calculate_pnl_percentage(
@@ -439,16 +415,24 @@ class MarketMaker:
                         pos["mark_price"], 
                         pos["size"] > 0
                     )
-                    print(f"   {coin}: {side} {abs(pos['size']):.4f} @ ${pos['entry_price']:.2f} | PnL: ${pos['unrealized_pnl']:.2f} ({pnl_pct:.2f}%)")
+                    print(f"   {coin}: {side} {abs(pos['size']):.0f} @ ${pos['entry_price']:.6f} | PnL: ${pos['unrealized_pnl']:.2f} ({pnl_pct:.2f}%)")
             
-            if active_positions == 0:
-                print("   No active positions")
+            # Show open orders
+            for coin in self.coins:
+                open_orders = self.client.get_open_orders(coin)
+                if open_orders:
+                    for order in open_orders:
+                        side = "BID" if order["side"] == "buy" else "ASK"
+                        print(f"   {coin}: {side} {order['size']:.0f} @ ${order['price']:.6f}")
             
-            print(f"   Total PnL: ${total_pnl:.2f}")
+            if total_pnl == 0 and not any(self.client.get_open_orders(coin) for coin in self.coins):
+                print("   No positions or orders")
+            else:
+                print(f"   Total PnL: ${total_pnl:.2f}")
             
-            # Show why no trades are happening
+            # Show why no trades are happening (only if there are reasons)
             if self.no_trade_reasons:
-                print("\n🚫 No Trade Reasons:")
+                print("\n🚫 No trades:")
                 for coin, reason in self.no_trade_reasons.items():
                     print(f"   {coin}: {reason}")
             
