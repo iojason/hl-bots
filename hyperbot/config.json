@@ -3,9 +3,9 @@
   "wallet_address": "0x07Cf550BFB384487dea8F2EA7842BE931c9aDae7",
   "coins": ["BTC", "ETH", "SOL"],
   "loop_ms": 500,
-  "min_spread_bps": 2.5,
+  "min_spread_bps": 2.0,
   "size_notional_usd": 150,
-  "max_position_usd": 450,
+  "max_position_usd": 300,
   "take_profit_bps": 20.0,
   "stop_loss_bps": 40.0,
   "max_orders_per_coin": 2
