@@ -34,7 +34,11 @@ class MarketMaker:
     def quantize_price(self, price: float, coin: str) -> float:
         """Quantize price to tick size."""
         tick_size = self.client.get_tick_size(coin)
-        return round(price / tick_size) * tick_size
+        quantized = round(price / tick_size) * tick_size
+        # Ensure we don't round to zero
+        if quantized <= 0:
+            quantized = tick_size
+        return quantized
     
     def quantize_size(self, size: float, coin: str) -> float:
         """Quantize size to size step."""
@@ -75,6 +79,7 @@ class MarketMaker:
         else:  # Short position
             pnl_bps = ((entry_price - mark_price) / entry_price) * 10000
         
+        # Take profit at much lower threshold for market making
         return pnl_bps >= self.take_profit_bps
     
     def should_stop_loss(self, position: Dict) -> bool:
@@ -117,6 +122,44 @@ class MarketMaker:
         
         return True
     
+    def should_skew_orders(self, coin: str) -> Tuple[bool, bool]:
+        """Determine if we should skew orders based on current position."""
+        position = self.client.get_position(coin)
+        position_size = position["size"]
+        
+        # If we have ANY position, check if it's profitable first
+        if abs(position_size) > 0.0001:  # Any position at all
+            entry_price = position["entry_price"]
+            mark_price = position["mark_price"]
+            
+            # Calculate current PnL
+            if position_size > 0:  # Long position
+                pnl_bps = ((mark_price - entry_price) / entry_price) * 10000
+            else:  # Short position
+                pnl_bps = ((entry_price - mark_price) / entry_price) * 10000
+            
+            print(f"🔍 {coin}: Position PnL: {pnl_bps:.1f} bps (entry: {entry_price:.6f}, mark: {mark_price:.6f})")
+            
+            # If position is profitable, close it
+            if pnl_bps > 0:
+                print(f"💰 {coin}: Closing profitable position ({pnl_bps:.1f} bps)")
+                self.close_position(coin, position)
+                return False, False
+            
+            # If position is small loss, close it quickly
+            elif pnl_bps > -5.0:  # Less than 5 bps loss
+                print(f"🔄 {coin}: Closing small loss position ({pnl_bps:.1f} bps)")
+                self.close_position(coin, position)
+                return False, False
+            
+            # If position is larger loss, wait for recovery or stop loss
+            else:
+                print(f"⏸️ {coin}: Holding position with loss ({pnl_bps:.1f} bps)")
+                return False, False
+        
+        # Only place orders when we have no position
+        return True, True
+    
     def place_market_making_orders(self, coin: str):
         """Place market making orders for a coin."""
         try:
@@ -152,54 +195,55 @@ class MarketMaker:
             # Calculate break-even spread needed
             break_even_spread = (total_maker_fees * 2) / order_size
             
-            # Calculate prices (slightly inside the spread)
+            # Calculate prices with better slippage protection
             tick_size = self.client.get_tick_size(coin)
-            bid_price = self.quantize_price(bid + tick_size, coin)  # One tick above bid
-            ask_price = self.quantize_price(ask - tick_size, coin)  # One tick below ask
+            market_spread = ask - bid
             
-            # Calculate realistic market making profit
-            # We place orders slightly inside the spread, so our actual profit is smaller
-            market_spread = ask - bid  # The actual market spread
-            our_spread = ask_price - bid_price  # Our order spread
-            spread_captured = market_spread - our_spread  # What we capture
-            realistic_profit = (spread_captured / 2) * order_size  # Half for each order
+            print(f"🔍 {coin}: Market bid: ${bid:.6f}, ask: ${ask:.6f}, spread: ${market_spread:.6f}, tick_size: ${tick_size:.6f}")
             
-            # Calculate fees for a complete round trip (buy + sell)
-            bid_value = bid_price * order_size
-            ask_value = ask_price * order_size
-            
-            # If both orders are maker orders (our strategy), we pay maker fees
-            maker_fees = (bid_value + ask_value) * maker_fee_rate
-            
-            # Net profit after fees
-            net_profit = realistic_profit - maker_fees
-            
-            # Calculate break-even spread needed
-            # We need enough spread to cover fees plus a small profit margin
-            min_profit_margin = maker_fees * 05  # 2.5% profit margin on fees (reduced from 10%)
-            total_cost = maker_fees + min_profit_margin
-            break_even_spread = (total_cost * 2) / order_size  # Need to cover both buy and sell fees
-            
-            # Check if spread is wide enough to be profitable after fees
-            current_spread = ask - bid
-            print(f"🔍 {coin}: Current spread ${current_spread:.4f}, need ${break_even_spread:.4f}")
-            print(f"🔍 {coin}: Fees ${maker_fees:.4f}, profit margin ${min_profit_margin:.4f}")
-            
-            # Use a more aggressive check - only require 66% of break-even spread
-            # ETH Example:
-            # 🔍 ETH: Current spread $1.8000, need $1.79 (60% of $2.98)
-            # ✅ ETH: Should now trade! (1.8000 > 1.79)
-            aggressive_break_even = break_even_spread * 0.60
-            if current_spread <= aggressive_break_even:
-                print(f"⚠️ {coin}: Spread too tight - Current: {current_spread:.4f}, Need: {aggressive_break_even:.4f}")
-                self.no_trade_reasons[coin] = f"Spread too tight: ${current_spread:.4f} < ${aggressive_break_even:.4f}"
+            # Check if spread is wide enough for our tick size
+            if market_spread <= tick_size * 2:
+                print(f"⚠️ {coin}: Spread too tight for tick size - spread: ${market_spread:.6f}, need: ${tick_size * 2:.6f}")
                 return
             
-            # Double-check that we'll actually be profitable
-            print(f"🔍 {coin}: Net profit ${net_profit:.4f}")
-            if net_profit <= 0:
-                print(f"⚠️ {coin}: Not profitable after fees - Net profit: ${net_profit:.4f}")
-                self.no_trade_reasons[coin] = f"Not profitable: ${net_profit:.4f}"
+            # For very tight spreads, place orders at market prices
+            # For wider spreads, place orders one tick inside
+            if market_spread <= tick_size * 4:
+                # Very tight spread - place at market
+                bid_price = self.quantize_price(bid, coin)
+                ask_price = self.quantize_price(ask, coin)
+                print(f"🔍 {coin}: Using market prices (tight spread)")
+            else:
+                # Wider spread - place one tick inside
+                bid_price = self.quantize_price(bid + tick_size, coin)
+                ask_price = self.quantize_price(ask - tick_size, coin)
+                print(f"🔍 {coin}: Using one tick inside (wider spread)")
+            
+            print(f"🔍 {coin}: Order bid: ${bid_price:.6f}, ask: ${ask_price:.6f}")
+            
+            # Ensure our bid is still below our ask
+            if bid_price >= ask_price:
+                print(f"⚠️ {coin}: Invalid order prices after quantization")
+                return
+            
+            # Calculate our actual spread
+            our_spread = ask_price - bid_price
+            print(f"🔍 {coin}: Our spread: ${our_spread:.6f} (bid: ${bid_price:.6f}, ask: ${ask_price:.6f})")
+            
+            # Calculate fees for our orders
+            bid_value = bid_price * order_size
+            ask_value = ask_price * order_size
+            maker_fees = (bid_value + ask_value) * maker_fee_rate
+            
+            # Calculate potential profit (our spread minus fees)
+            potential_profit = (our_spread * order_size) - maker_fees
+            
+            print(f"🔍 {coin}: Potential profit: ${potential_profit:.4f} (spread: ${our_spread:.6f}, fees: ${maker_fees:.4f})")
+            
+            # Check if profitable
+            if potential_profit <= 0:
+                print(f"⚠️ {coin}: Not profitable - profit: ${potential_profit:.4f}")
+                self.no_trade_reasons[coin] = f"Not profitable: ${potential_profit:.4f}"
                 return
             
             # Calculate potential profit per trade (when both orders get filled)
@@ -222,19 +266,28 @@ class MarketMaker:
             print(f"   💰 Maker fees: ${maker_fees:.4f} | Net profit: ${net_profit:.4f}")
             print(f"   💰 Break-even spread: {break_even_spread:.4f} | Min spread needed: {break_even_spread:.4f}")
             
-            # Place bid order
-            bid_result = self.client.place_order(coin, True, order_size, bid_price)
-            if bid_result["success"]:
-                print(f"✅ {coin}: Bid order placed successfully")
-            else:
-                print(f"❌ {coin}: Bid order failed - {bid_result.get('error', 'Unknown error')}")
+            # Check if we should skew orders based on current position
+            should_bid, should_ask = self.should_skew_orders(coin)
             
-            # Place ask order
-            ask_result = self.client.place_order(coin, False, order_size, ask_price)
-            if ask_result["success"]:
-                print(f"✅ {coin}: Ask order placed successfully")
+            # Place bid order (if we should)
+            if should_bid:
+                bid_result = self.client.place_order(coin, True, order_size, bid_price)
+                if bid_result["success"]:
+                    print(f"✅ {coin}: Bid order placed successfully")
+                else:
+                    print(f"❌ {coin}: Bid order failed - {bid_result.get('error', 'Unknown error')}")
             else:
-                print(f"❌ {coin}: Ask order failed - {ask_result.get('error', 'Unknown error')}")
+                print(f"⏸️ {coin}: Skipping bid order (long position)")
+            
+            # Place ask order (if we should)
+            if should_ask:
+                ask_result = self.client.place_order(coin, False, order_size, ask_price)
+                if ask_result["success"]:
+                    print(f"✅ {coin}: Ask order placed successfully")
+                else:
+                    print(f"❌ {coin}: Ask order failed - {ask_result.get('error', 'Unknown error')}")
+            else:
+                print(f"⏸️ {coin}: Skipping ask order (short position)")
             
             # Update last order time and clear no-trade reason
             self.last_order_time[coin] = time.time()
@@ -271,6 +324,13 @@ class MarketMaker:
                     position["size"] > 0
                 )
                 print(f"🛑 {coin}: Stop loss - Size: {position['size']:.4f}, PnL: ${position['unrealized_pnl']:.2f} ({pnl_pct:.2f}%)")
+                self.close_position(coin, position)
+                return
+            
+            # Check for position size limits (prevent accumulation)
+            position_value = abs(position["size"] * position["mark_price"])
+            if position_value > self.max_position_usd * 0.8:  # 80% of max position
+                print(f"⚠️ {coin}: Position too large ({position_value:.2f}), closing to reduce risk")
                 self.close_position(coin, position)
                 return
             

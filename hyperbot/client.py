@@ -180,13 +180,62 @@ class SimpleHLClient:
             return []
     
     def get_tick_size(self, coin: str) -> float:
-        """Get tick size for a coin."""
+        """Get tick size for a coin by analyzing the order book."""
+        try:
+            # Get the order book
+            orderbook = self.get_orderbook(coin)
+            if not orderbook or "levels" not in orderbook:
+                return self._get_fallback_tick_size(coin)
+            
+            levels = orderbook["levels"]
+            if not levels or len(levels) < 2:
+                return self._get_fallback_tick_size(coin)
+            
+            # Find the smallest price difference between consecutive levels
+            min_tick = float('inf')
+            
+            # Check all price levels (levels is a list of price levels)
+            for i in range(len(levels) - 1):
+                current_price = float(levels[i][0]["px"])
+                next_price = float(levels[i + 1][0]["px"])
+                price_diff = abs(current_price - next_price)
+                if price_diff > 0 and price_diff < min_tick:
+                    min_tick = price_diff
+            
+            # If we found a valid tick size, return it
+            if min_tick != float('inf') and min_tick > 0:
+                print(f"🔍 {coin}: Calculated tick size from order book: {min_tick}")
+                return min_tick
+            
+            return self._get_fallback_tick_size(coin)
+            
+        except Exception as e:
+            print(f"⚠️ Failed to calculate tick size for {coin}: {e}")
+            return self._get_fallback_tick_size(coin)
+    
+    def _get_fallback_tick_size(self, coin: str) -> float:
+        """Fallback tick size calculation based on coin type."""
         meta = self.get_meta()
         for asset in meta.get("universe", []):
             if asset.get("name") == coin:
-                px_decimals = asset.get("pxDecimals", 3)
-                return 10 ** (-px_decimals)
-        return 0.01  # Default fallback
+                # If pxDecimals is not in meta, calculate based on price level
+                if "pxDecimals" in asset:
+                    px_decimals = asset.get("pxDecimals", 3)
+                    return 10 ** (-px_decimals)
+                else:
+                    # For coins without pxDecimals, use a reasonable tick size
+                    # based on typical price levels
+                    if coin in ['kPEPE', 'kSHIB']:
+                        return 0.000001  # 0.000001 for very low-priced coins
+                    elif coin in ['DOGE']:
+                        return 0.00001  # 0.00001 for low-priced coins
+                    elif coin in ['BTC', 'ETH']:
+                        return 0.1  # 0.1 for high-priced coins
+                    elif coin in ['SOL']:
+                        return 0.01  # 0.01 for medium-priced coins
+                    else:
+                        return 0.001  # Default for unknown coins
+        return 0.001  # Default fallback
     
     def get_size_step(self, coin: str) -> float:
         """Get size step for a coin."""
