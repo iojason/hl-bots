@@ -146,35 +146,10 @@ class MarketMaker:
             # Calculate break-even spread needed
             break_even_spread = (total_maker_fees * 2) / order_size
             
-            # Check if spread is wide enough to be profitable after fees
-            current_spread = ask - bid
-            if current_spread <= break_even_spread:
-                print(f"⚠️ {coin}: Spread too tight - Current: {current_spread:.4f}, Need: {break_even_spread:.4f}")
-                return
-            
-            # Double-check that we'll actually be profitable
-            if net_profit <= 0:
-                print(f"⚠️ {coin}: Not profitable after fees - Net profit: ${net_profit:.4f}")
-                return
-            
             # Calculate prices (slightly inside the spread)
             tick_size = self.client.get_tick_size(coin)
             bid_price = self.quantize_price(bid + tick_size, coin)  # One tick above bid
             ask_price = self.quantize_price(ask - tick_size, coin)  # One tick below ask
-            
-            # Calculate potential profit per trade (when both orders get filled)
-            # This is the spread we capture when both bid and ask orders are executed
-            spread_per_unit = ask_price - bid_price
-            potential_profit_per_trade = spread_per_unit * order_size
-            potential_profit_percentage = (spread_per_unit / bid_price) * 100
-            
-            # Calculate potential profit per individual order (more realistic)
-            # Each order captures roughly half the spread when filled
-            mid_price = (bid + ask) / 2
-            bid_distance = mid_price - bid_price  # How far our bid is from mid
-            ask_distance = ask_price - mid_price  # How far our ask is from mid
-            avg_distance = (bid_distance + ask_distance) / 2
-            potential_profit_per_order = avg_distance * order_size
             
             # Calculate realistic market making profit
             # We place orders slightly inside the spread, so our actual profit is smaller
@@ -182,11 +157,6 @@ class MarketMaker:
             our_spread = ask_price - bid_price  # Our order spread
             spread_captured = market_spread - our_spread  # What we capture
             realistic_profit = (spread_captured / 2) * order_size  # Half for each order
-            
-            # Get user's actual fee rates
-            user_fees = self.client.get_user_fees()
-            maker_fee_rate = user_fees["userAddRate"]  # Actual maker fee rate
-            taker_fee_rate = user_fees["userCrossRate"]  # Actual taker fee rate
             
             # Calculate fees for a complete round trip (buy + sell)
             bid_value = bid_price * order_size
@@ -203,6 +173,30 @@ class MarketMaker:
             min_profit_margin = 0.0001  # $0.0001 minimum profit per trade
             total_cost = maker_fees + min_profit_margin
             break_even_spread = (total_cost * 2) / order_size  # Need to cover both buy and sell fees
+            
+            # Check if spread is wide enough to be profitable after fees
+            current_spread = ask - bid
+            if current_spread <= break_even_spread:
+                print(f"⚠️ {coin}: Spread too tight - Current: {current_spread:.4f}, Need: {break_even_spread:.4f}")
+                return
+            
+            # Double-check that we'll actually be profitable
+            if net_profit <= 0:
+                print(f"⚠️ {coin}: Not profitable after fees - Net profit: ${net_profit:.4f}")
+                return
+            
+            # Calculate potential profit per trade (when both orders get filled)
+            # This is the spread we capture when both bid and ask orders are executed
+            spread_per_unit = ask_price - bid_price
+            potential_profit_per_trade = spread_per_unit * order_size
+            potential_profit_percentage = (spread_per_unit / bid_price) * 100
+            
+            # Calculate potential profit per individual order (more realistic)
+            # Each order captures roughly half the spread when filled
+            bid_distance = mid_price - bid_price  # How far our bid is from mid
+            ask_distance = ask_price - mid_price  # How far our ask is from mid
+            avg_distance = (bid_distance + ask_distance) / 2
+            potential_profit_per_order = avg_distance * order_size
             
             # Place orders
             print(f"📈 {coin}: Placing orders - Bid: {bid_price:.4f}, Ask: {ask_price:.4f}, Size: {order_size:.4f}")
