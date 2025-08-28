@@ -1,0 +1,27 @@
+{
+  "bot_id": "simple-trading-v1",
+  "name": "Simple Trading Strategy",
+  "mode": "testnet",
+  "wallet_address": "0x07Cf550BFB384487dea8F2EA7842BE931c9aDae7",
+  "config_version": "1.0.0",
+  "coins": [
+    "BTC",
+    "DOGE",
+    "HYPE",
+    "SOL",
+    "kSHIB"
+  ],
+  "loop_ms": 1000,
+  "min_replace_ms": 1000,
+  "size_notional_usd": 25,
+  "max_per_coin_notional": 400,
+  "max_gross_notional": 2000,
+  "min_spread_bps": 5.0,
+  "use_websocket": false,
+  "take_profit_min_bps": 30.0,
+  "take_profit_min_usd": 50.0,
+  "telemetry_enabled": false,
+  "telemetry_console": false,
+  "fills_log_enabled": false,
+  "lifecycle_log_enabled": false
+}

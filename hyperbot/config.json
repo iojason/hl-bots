@@ -1,0 +1,12 @@
+{
+  "mode": "testnet",
+  "wallet_address": "0x07Cf550BFB384487dea8F2EA7842BE931c9aDae7",
+  "coins": ["BTC", "ETH", "SOL"],
+  "loop_ms": 500,
+  "size_notional_usd": 25,
+  "max_position_usd": 200,
+  "min_spread_bps": 5.0,
+  "take_profit_bps": 30.0,
+  "stop_loss_bps": 50.0,
+  "max_orders_per_coin": 2
+}
