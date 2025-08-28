@@ -24,6 +24,9 @@ class MarketMaker:
         self.trade_history = []
         self.last_positions = {}
         
+        # Track why no trades are happening
+        self.no_trade_reasons = {}
+        
         print(f"🎯 Market maker initialized for {len(self.coins)} coins")
         print(f"   Size: ${self.size_notional_usd}, Max Position: ${self.max_position_usd}")
         print(f"   Min Spread: {self.min_spread_bps}bps, Take Profit: {self.take_profit_bps}bps")
@@ -124,7 +127,10 @@ class MarketMaker:
             
             # Check spread
             spread_bps = self.calculate_spread_bps(bid, ask)
+            print(f"🔍 {coin}: Market spread {spread_bps:.1f}bps (need {self.min_spread_bps}bps)")
             if spread_bps < self.min_spread_bps:
+                print(f"⚠️ {coin}: Spread too narrow - {spread_bps:.1f}bps < {self.min_spread_bps}bps")
+                self.no_trade_reasons[coin] = f"Spread too narrow: {spread_bps:.1f}bps < {self.min_spread_bps}bps"
                 return
             
             # Calculate order size first
@@ -170,19 +176,24 @@ class MarketMaker:
             
             # Calculate break-even spread needed
             # We need enough spread to cover fees plus a small profit margin
-            min_profit_margin = 0.0001  # $0.0001 minimum profit per trade
+            min_profit_margin = maker_fees * 0.1  # 10% profit margin on fees
             total_cost = maker_fees + min_profit_margin
             break_even_spread = (total_cost * 2) / order_size  # Need to cover both buy and sell fees
             
             # Check if spread is wide enough to be profitable after fees
             current_spread = ask - bid
+            print(f"🔍 {coin}: Current spread ${current_spread:.4f}, need ${break_even_spread:.4f}")
+            print(f"🔍 {coin}: Fees ${maker_fees:.4f}, profit margin ${min_profit_margin:.4f}")
             if current_spread <= break_even_spread:
                 print(f"⚠️ {coin}: Spread too tight - Current: {current_spread:.4f}, Need: {break_even_spread:.4f}")
+                self.no_trade_reasons[coin] = f"Spread too tight: ${current_spread:.4f} < ${break_even_spread:.4f}"
                 return
             
             # Double-check that we'll actually be profitable
+            print(f"🔍 {coin}: Net profit ${net_profit:.4f}")
             if net_profit <= 0:
                 print(f"⚠️ {coin}: Not profitable after fees - Net profit: ${net_profit:.4f}")
+                self.no_trade_reasons[coin] = f"Not profitable: ${net_profit:.4f}"
                 return
             
             # Calculate potential profit per trade (when both orders get filled)
@@ -219,8 +230,10 @@ class MarketMaker:
             else:
                 print(f"❌ {coin}: Ask order failed - {ask_result.get('error', 'Unknown error')}")
             
-            # Update last order time
+            # Update last order time and clear no-trade reason
             self.last_order_time[coin] = time.time()
+            if coin in self.no_trade_reasons:
+                del self.no_trade_reasons[coin]
             
         except Exception as e:
             print(f"❌ Error placing orders for {coin}: {e}")
@@ -366,6 +379,12 @@ class MarketMaker:
                 print("   No active positions")
             
             print(f"   Total PnL: ${total_pnl:.2f}")
+            
+            # Show why no trades are happening
+            if self.no_trade_reasons:
+                print("\n🚫 No Trade Reasons:")
+                for coin, reason in self.no_trade_reasons.items():
+                    print(f"   {coin}: {reason}")
             
             # Show recent trades
             if self.trade_history:
