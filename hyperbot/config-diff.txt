@@ -1,0 +1,9 @@
+Tier 1: Moderately Volatile
+"coins": ["SOL", "AVAX", "MATIC", "LINK"]
+
+
+Tier 2: More Volatile
+"coins": ["DOGE", "SHIB", "PEPE", "BONK"]
+
+Tier 3: Highest Volatility
+"coins": ["WIF", "FLOKI", "BOME", "POPCAT"]

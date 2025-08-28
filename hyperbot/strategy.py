@@ -176,7 +176,7 @@ class MarketMaker:
             
             # Calculate break-even spread needed
             # We need enough spread to cover fees plus a small profit margin
-            min_profit_margin = maker_fees * 0.05  # 5% profit margin on fees (reduced from 10%)
+            min_profit_margin = maker_fees * 05  # 2.5% profit margin on fees (reduced from 10%)
             total_cost = maker_fees + min_profit_margin
             break_even_spread = (total_cost * 2) / order_size  # Need to cover both buy and sell fees
             
@@ -189,7 +189,7 @@ class MarketMaker:
             # ETH Example:
             # 🔍 ETH: Current spread $1.8000, need $1.79 (60% of $2.98)
             # ✅ ETH: Should now trade! (1.8000 > 1.79)
-            aggressive_break_even = break_even_spread * 0.66
+            aggressive_break_even = break_even_spread * 0.60
             if current_spread <= aggressive_break_even:
                 print(f"⚠️ {coin}: Spread too tight - Current: {current_spread:.4f}, Need: {aggressive_break_even:.4f}")
                 self.no_trade_reasons[coin] = f"Spread too tight: ${current_spread:.4f} < ${aggressive_break_even:.4f}"

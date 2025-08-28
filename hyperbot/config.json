@@ -1,7 +1,7 @@
 {
   "mode": "testnet",
   "wallet_address": "0x07Cf550BFB384487dea8F2EA7842BE931c9aDae7",
-  "coins": ["BTC", "ETH", "SOL"],
+  "coins": ["DOGE", "SHIB", "PEPE"],
   "loop_ms": 500,
   "min_spread_bps": 2.0,
   "size_notional_usd": 150,
