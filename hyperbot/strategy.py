@@ -152,6 +152,11 @@ class MarketMaker:
                 print(f"⚠️ {coin}: Spread too tight - Current: {current_spread:.4f}, Need: {break_even_spread:.4f}")
                 return
             
+            # Double-check that we'll actually be profitable
+            if net_profit <= 0:
+                print(f"⚠️ {coin}: Not profitable after fees - Net profit: ${net_profit:.4f}")
+                return
+            
             # Calculate prices (slightly inside the spread)
             tick_size = self.client.get_tick_size(coin)
             bid_price = self.quantize_price(bid + tick_size, coin)  # One tick above bid
@@ -194,7 +199,10 @@ class MarketMaker:
             net_profit = realistic_profit - maker_fees
             
             # Calculate break-even spread needed
-            break_even_spread = (maker_fees * 2) / order_size  # Need to cover both buy and sell fees
+            # We need enough spread to cover fees plus a small profit margin
+            min_profit_margin = 0.0001  # $0.0001 minimum profit per trade
+            total_cost = maker_fees + min_profit_margin
+            break_even_spread = (total_cost * 2) / order_size  # Need to cover both buy and sell fees
             
             # Place orders
             print(f"📈 {coin}: Placing orders - Bid: {bid_price:.4f}, Ask: {ask_price:.4f}, Size: {order_size:.4f}")
